@@ -144,41 +144,6 @@ class G1AmpEnv(AmpEnv):
 
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_env_ids) > 0:
-            # [PRG] aggregated termination diagnostics: at every reset,
-            # tally the dying envs' root-z into a histogram and the
-            # contact-force top bodies; print a compact summary every 200
-            # resets so it lands inside the platform log tail window.
-            diag = getattr(self, "_diag", None)
-            if diag is None:
-                diag = self._diag = {"n": 0, "zsum": [], "bodies": {}, "bc": 0}
-            diag["n"] += int(len(reset_env_ids))
-            zs = self.scene["robot"].data.root_pos_w[reset_env_ids, 2]
-            diag["zsum"].extend(zs[: min(len(zs), 64)].tolist())
-            diag["bc"] += int(self.termination_manager.get_term("base_contact")[reset_env_ids].sum())
-            try:
-                from isaaclab.managers import SceneEntityCfg
-                sensor = self.scene["contact_forces"]
-                if self._prg_foot_ids is None:
-                    cfg = SceneEntityCfg("contact_forces",
-                                         body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
-                                         preserve_order=True)
-                    cfg.resolve(self.scene)
-                    self._prg_foot_ids = cfg.body_ids
-                nf = sensor.data.net_forces_w[:, -1, :, :].norm(dim=-1)  # (N, B)
-                hit = (nf[reset_env_ids] > 1.0)
-                for b in range(hit.shape[1]):
-                    c = int(hit[:, b].sum())
-                    if c:
-                        diag["bodies"][sensor.body_names[b]] = diag["bodies"].get(sensor.body_names[b], 0) + c
-            except Exception as e:  # noqa: BLE001
-                diag["bodies"]["<dump-failed>"] = diag["bodies"].get("<dump-failed>", 0) + 1
-            if diag["n"] >= 200 and diag["n"] % 200 < len(reset_env_ids):
-                import statistics as _st
-                zs_ = diag["zsum"][-200:]
-                top = sorted(diag["bodies"].items(), key=lambda kv: -kv[1])[:8]
-                print(f"[TERM-DIAG] resets={diag['n']} base_contact_frac={diag['bc']/max(1,diag['n']):.2f} "
-                      f"death_z p50={_st.median(zs_):.3f} min={min(zs_):.3f} max={max(zs_):.3f} "
-                      f"top_bodies={top}", flush=True)
             self.recorder_manager.record_pre_reset(reset_env_ids)
             self._reset_idx(reset_env_ids)
             self.scene.write_data_to_sim()
