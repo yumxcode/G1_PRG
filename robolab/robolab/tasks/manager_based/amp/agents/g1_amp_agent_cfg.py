@@ -16,3 +16,10 @@ from ..agents.x1_amp_agent_cfg import X1RslRlOnPolicyRunnerAmpCfg
 class G1RslRlOnPolicyRunnerAmpCfg(X1RslRlOnPolicyRunnerAmpCfg):
     experiment_name = "g1_amp"
     wandb_project = "g1_amp"
+    # B0 postmortem (TASK_20261118_041, 2300 iters): with X1's init noise
+    # 1.0 (±0.25 rad joint offsets) the G1's narrower static stability
+    # basin dies in ~6 steps (bad_orientation 100%), the actor noise std
+    # free-runs to 1.66, and no task gradient ever forms. Halve the initial
+    # exploration so episodes live long enough to learn from; the policy
+    # can still widen it if the gradient asks (learned std).
+    policy = X1RslRlOnPolicyRunnerAmpCfg.policy.replace(init_noise_std=0.5)
