@@ -12,7 +12,7 @@ terms not NaN. Failure layer is directly readable from which print is the
 last one seen.
 """
 import os
-import runpy
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,8 +27,8 @@ os.environ.setdefault("X1_GAIT_CLOCK", "1")     # obs/reward weight plumbing
 os.environ.setdefault("G1_CMD_LO", "0.2")       # walk band
 os.environ.setdefault("G1_CMD_HI", "1.5")
 
-sys.argv = [
-    str(_train),
+argv = [
+    sys.executable, str(_train),
     "--task=G1-AMP",
     "--headless",
     "--logger=tensorboard",
@@ -36,7 +36,11 @@ sys.argv = [
     "--max_iterations=100",
     "--run_name=g1_smoke_prg_c1a",
 ]
-print(f"[G1-SMOKE] argv={sys.argv}", flush=True)
+print(f"[G1-SMOKE] argv={argv}", flush=True)
 print(f"[G1-SMOKE] G1_PRG={os.environ['G1_PRG']} "
       f"PRG_RESET_MODE={os.environ['PRG_RESET_MODE']}", flush=True)
-runpy.run_path(str(_train), run_name="__main__")
+# subprocess (not runpy): running train.py as a SCRIPT puts its own dir at
+# sys.path[0], so its sibling module `cli_args` imports — the X1 launcher
+# convention. Stream stdout/stderr straight through so the platform log
+# shows every audit print unbuffered.
+sys.exit(subprocess.call(argv, cwd=str(_root)))
