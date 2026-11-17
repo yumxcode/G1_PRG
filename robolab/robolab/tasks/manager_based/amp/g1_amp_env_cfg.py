@@ -241,21 +241,20 @@ class G1AmpEnvCfg(X1AmpEnvCfg):
             if manager is not None:
                 _retarget_scene_entity_names(manager)
 
-        # base_contact body list REBUILT for G1 (post-retarget): arms are
-        # REMOVED entirely — G1's natural hanging arms graze the thighs
-        # (self-collision > 1 N) while standing perfectly upright, and with
-        # policy action noise (±0.25 rad shoulder swings) elbow/forearm
-        # contacts fire within 2 steps of every episode
-        # (judge-run TASK_20261117_377: episode length ~1.6 with base_contact
-        # 100% while the zero-action probe holds z=0.79 for 50+ steps).
-        # Arm contacts stay penalized via undesired_contacts (reward), not
-        # terminated. Falls = pelvis/hip/knee/torso ground contact only.
+        # base_contact REBUILT for G1 (post-retarget). TERM-DIAG evidence
+        # (TASK_20261118_013): envs die at death_z=0.797 m == STANDING
+        # height with base_contact 100% — the GMR primitive-collision URDF
+        # produces persistent >1 N SELF-collisions (pelvis-thigh, thigh-
+        # calf at the joints) that the X1 1 N threshold reads as a fall.
+        # Fix: falls are judged ONLY by pelvis/torso ground impacts with a
+        # 25 N threshold (a real fall slams >>25 N; self-collisions sit
+        # near 1-5 N). Hip/knee/arm contacts stay in undesired_contacts
+        # (reward-side) where magnitudes matter, not terminations.
         self.terminations.base_contact.params["sensor_cfg"].body_names = [
-            ".*_hip_.*_link",
-            ".*_knee_link",
             "pelvis",
-            "(waist_yaw|waist_roll|torso)_link",
+            "torso_link",
         ]
+        self.terminations.base_contact.params["threshold"] = 25.0
 
         # Discriminator key bodies: 10 role-identical G1 bodies (G1 demo
         # library pending; kept consistent for the future retarget schema).
