@@ -241,6 +241,21 @@ class G1AmpEnvCfg(X1AmpEnvCfg):
             if manager is not None:
                 _retarget_scene_entity_names(manager)
 
+        # base_contact body list REBUILT for G1 (post-retarget): wrists are
+        # REMOVED — G1's natural hanging hands graze the thighs (self
+        # collision > 1 N) while standing perfectly upright, which the X1
+        # list would read as a fall (stand-probe TASK_20261117_375: z stayed
+        # 0.79 m for 22 steps yet base_contact fired). Knee/elbow use the G1
+        # exact names; pelvis/hip/shoulder patterns match natively.
+        self.terminations.base_contact.params["sensor_cfg"].body_names = [
+            ".*_hip_.*_link",
+            ".*_knee_link",
+            "pelvis",
+            "(waist_yaw|waist_roll|torso)_link",
+            ".*_shoulder_.*_link",
+            ".*_elbow_link",
+        ]
+
         # Discriminator key bodies: 10 role-identical G1 bodies (G1 demo
         # library pending; kept consistent for the future retarget schema).
         _mds = getattr(self.motion_data, "motion_dataset", None)
