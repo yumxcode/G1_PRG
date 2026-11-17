@@ -24,6 +24,7 @@ _train = _root / "robolab" / "scripts" / "rsl_rl" / "train.py"
 os.environ.setdefault("G1_PRG", "1")            # C1a: PRG adaptive clock ON
 os.environ.setdefault("PRG_RESET_MODE", "hard") # hard reset first (C1a)
 os.environ.setdefault("X1_GAIT_CLOCK", "1")     # obs/reward weight plumbing
+os.environ.setdefault("X1_STYLE_SCALE", "0")    # task-first: AMP style OFF
 os.environ.setdefault("G1_CMD_LO", "0.2")       # walk band
 os.environ.setdefault("G1_CMD_HI", "1.5")
 

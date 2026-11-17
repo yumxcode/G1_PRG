@@ -227,14 +227,19 @@ class G1AmpEnvCfg(X1AmpEnvCfg):
                 setattr(_mds, _attr, list(G1_KEY_BODY_NAMES))
                 print(f"[G1-RETARGET] motion_data.motion_dataset.{_attr} = {G1_KEY_BODY_NAMES}")
 
-        # G1 demo dataset: placeholder until the G1 motion library is
-        # retargeted (C1 is task-first / zero-AMASS). Empty weights keep AMP
-        # sampling inert; X1_AMP_NUM_STEPS & friends keep their X1 semantics.
+        # G1 demo dataset: a placeholder standing clip satisfies the
+        # MotionDataManager (it asserts dir+files and reads dof_pos[0] — an
+        # empty weights dict crashes at num_dofs). The clip is INERT for the
+        # policy because G1 runs task-first with X1_STYLE_SCALE=0 (style
+        # reward fully off, beyondmimic-phase-A precedent); swap in a real
+        # retargeted G1 library only if a future variant wants AMP.
         self.motion_data.motion_dataset.motion_data_dir = os.path.join(
             ROBOLAB_ROOT_DIR, "data", "motions",
             os.environ.get("G1_MOTION_DIR", "g1_lab_v1")
         )
-        self.motion_data.motion_dataset.motion_data_weights = {}
+        self.motion_data.motion_dataset.motion_data_weights = {
+            "standing_placeholder": 1.0,
+        }
 
         # Commands: G1 starting band (walk spectrum first). G1_CMD_LO/G1_CMD_HI
         # widen later; X1 command env-vars are untouched.
