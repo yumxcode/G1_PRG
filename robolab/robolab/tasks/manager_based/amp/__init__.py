@@ -114,7 +114,7 @@ gym.register(
 
 gym.register(
     id="G1-AMP",
-    entry_point=f"{__name__}.amp_env:AmpEnv",
+    entry_point=f"{__name__}.g1_amp_env:G1AmpEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.g1_amp_env_cfg:G1AmpEnvCfg",
@@ -124,7 +124,7 @@ gym.register(
 
 gym.register(
     id="G1-AMP-Play",
-    entry_point=f"{__name__}.amp_env:AmpEnv",
+    entry_point=f"{__name__}.g1_amp_env:G1AmpEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.g1_amp_env_cfg:G1AmpEnvCfg_PLAY",

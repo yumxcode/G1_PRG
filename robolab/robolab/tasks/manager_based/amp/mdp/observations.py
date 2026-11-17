@@ -398,3 +398,29 @@ def gait_clock_obs(
     v = torch.norm(cmd[:, :2], dim=1)
     t = env.episode_length_buf * env.step_dt
     return clock_obs(t, v)
+
+
+def prg_clock_obs(
+    env: ManagerBasedEnv,
+    command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """C1 PRG: adaptive gait-clock phase channels (N, 4).
+
+    Same (N,4) layout and column order as v71 gait_clock_obs
+    ([sinL, sinR, cosL, cosR]) but the phase comes from the env's PRGState
+    (contact-triggered phase reset + policy frequency modulation,
+    mdp/prg_clock.py) instead of the pure-time formula. Falls back to the
+    v71 pure clock when the env carries no PRG state (B0 baseline mode or
+    plain AmpEnv), so the obs prefix layout is IDENTICAL in every mode.
+
+    The sim2sim/deploy twin rebuilds the same state machine from
+    (dt, v_cmd, foot contact, delta_f) each step — mdp/prg_clock.py is
+    isaaclab-free by construction.
+    """
+    st = getattr(env, "prg_state", None)
+    if st is not None:
+        obs = st.clock_obs()
+        if not torch.is_tensor(obs):  # numpy backend safety
+            obs = torch.as_tensor(obs, device=env.device)
+        return obs.to(env.device)
+    return gait_clock_obs(env, command_name)

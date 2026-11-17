@@ -2071,3 +2071,108 @@ def bad_demo_tracking(
     speed = torch.linalg.vector_norm(cmd[:, :2], dim=1)
     gate = env._demo_track_ok & (speed > min_cmd_speed)
     return (err > threshold_rad) & gate
+
+
+# ---------------------------------------------------------------------------
+# C1 PRG reward terms (2026-11-17): same scoring as the v71 clock terms but
+# the phase comes from the env's ADAPTIVE clock state (env.prg_state,
+# mdp/prg_clock.py) — contact-triggered phase reset + policy frequency
+# modulation. Falls back to the v71 pure-time clock when the env carries no
+# PRG state, so a single recipe covers B0 (pure clock) and C1 (adaptive).
+# ---------------------------------------------------------------------------
+
+def _prg_clock_common(env, command_name, min_cmd_speed, max_cmd_speed):
+    """Shared clock state for the PRG terms: (phi (N,2), v (N,), gate (N,)).
+
+    phi = env.prg_state.phi when the env runs the PRG clock, else the v71
+    pure-time phase (identical semantics to _gait_clock_common)."""
+    st = getattr(env, "prg_state", None)
+    cmd = env.command_manager.get_command(command_name)
+    v = torch.norm(cmd[:, :2], dim=1)
+    if st is not None:
+        phi = st.phi
+        if not torch.is_tensor(phi):
+            phi = torch.as_tensor(phi, device=env.device)
+        phi = phi.to(device=env.device, dtype=torch.float32)
+    else:
+        phi, v, _ = _gait_clock_common(env, command_name, min_cmd_speed, max_cmd_speed)
+    gate = ((v > min_cmd_speed) & (v < max_cmd_speed)).float()
+    return phi, v, gate
+
+
+def prg_foot_clock_height(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    sigma_z: float = 0.03,
+    min_cmd_speed: float = 0.15,
+    max_cmd_speed: float = 2.6,
+) -> torch.Tensor:
+    """PRG twin of foot_clock_height: swing-height tracking scored against
+    the ADAPTIVE clock phase z*(phi_prg). Identical kernel/bells as v71
+    (see foot_clock_height docstring); only the phase source differs."""
+    st = getattr(env, "prg_state", None)
+    asset: Articulation = env.scene[asset_cfg.name]
+    heel_z = _foot_end_z(env, asset_cfg, _HEEL_OFF)
+    toe_z = _foot_end_z(env, asset_cfg, _TOE_OFF)
+    h_min = torch.minimum(heel_z, toe_z)                       # (N, 2)
+
+    phi, v, gate = _prg_clock_common(env, command_name, min_cmd_speed, max_cmd_speed)
+    if st is not None:
+        try:
+            from . import prg_clock as _pc
+        except ImportError:  # file-path module load (local unit tests)
+            import importlib.util as _ilu
+            from pathlib import Path as _P
+            _spec = _ilu.spec_from_file_location(
+                "amp_prg_clock", _P(__file__).resolve().parent / "prg_clock.py")
+            _pc = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_pc)
+        z_star = _pc.target_height(phi, v)
+        if not torch.is_tensor(z_star):
+            z_star = torch.as_tensor(z_star, device=env.device)
+        z_star = z_star.to(device=env.device, dtype=h_min.dtype)
+    else:
+        from .gait_clock import target_height
+        z_star = target_height(phi, v)
+    score = torch.exp(-torch.square((h_min - z_star) / sigma_z))
+    return score.sum(dim=-1) * gate
+
+
+def prg_contact_clock_timing(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    min_cmd_speed: float = 0.15,
+    max_cmd_speed: float = 2.6,
+) -> torch.Tensor:
+    """PRG twin of contact_clock_timing: contact-schedule hinge penalty
+    against the ADAPTIVE clock phase (anti-drag / anti-tap; identical
+    hinge windows as v71, only the phase source differs)."""
+    st = getattr(env, "prg_state", None)
+    contact_sensor: ContactSensor = env.scene[sensor_cfg.name]
+    in_contact = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0] > 1.0
+
+    phi, v, gate = _prg_clock_common(env, command_name, min_cmd_speed, max_cmd_speed)
+    if st is not None:
+        try:
+            from . import prg_clock as _pc
+        except ImportError:  # file-path module load (local unit tests)
+            import importlib.util as _ilu
+            from pathlib import Path as _P
+            _spec = _ilu.spec_from_file_location(
+                "amp_prg_clock", _P(__file__).resolve().parent / "prg_clock.py")
+            _pc = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_pc)
+        swing_mid = _pc.swing_mid_mask(phi, v)
+        stance_mid = _pc.stance_mid_mask(phi, v)
+        if not torch.is_tensor(swing_mid):
+            swing_mid = torch.as_tensor(swing_mid, device=env.device)
+        if not torch.is_tensor(stance_mid):
+            stance_mid = torch.as_tensor(stance_mid, device=env.device)
+    else:
+        from .gait_clock import swing_mid_mask, stance_mid_mask
+        swing_mid = swing_mid_mask(phi, v)
+        stance_mid = stance_mid_mask(phi, v)
+    wrong_contact = swing_mid & in_contact
+    wrong_air = stance_mid & (~in_contact)
+    return -(wrong_contact.float() + wrong_air.float()).sum(dim=-1) * gate

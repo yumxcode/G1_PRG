@@ -635,5 +635,45 @@ def _main():
     return 0
 
 
+
+
+# ---------------------------------------------------------------------------
+# 8. v71-mirrored reward helpers (target_height / swing_mid_mask /
+#    stance_mid_mask) must be bitwise-identical to mdp/gait_clock.py on the
+#    same (phi, v) inputs — these back the PRG reward terms.
+# ---------------------------------------------------------------------------
+def test_reward_helpers_match_v71_module():
+    rng = np.random.default_rng(7)
+    phi = rng.uniform(0.0, 1.0, size=(64, 2))
+    v = rng.uniform(0.0, 2.6, size=(64,))
+
+    def v71_target_height(phi, v):
+        d = np.clip(np.array([v71_duty(x) for x in np.atleast_1d(v)])[:, None], 0.55, 0.70)
+        h = np.clip(np.array([v71_h(x) for x in np.atleast_1d(v)])[:, None], 0.025, 0.075)
+        frac = (phi - d) / np.clip(1.0 - d, 1e-6, 1.0)
+        bell = np.sin(np.pi * np.clip(frac, 0.0, 1.0))
+        return np.where(frac > 0.0, h * bell, 0.0 * bell)
+
+    def v71_swing_mid(phi, v):
+        d = np.clip(np.array([v71_duty(x) for x in np.atleast_1d(v)])[:, None], 0.55, 0.70)
+        span = np.clip(1.0 - d, 1e-6, 1.0)
+        return (phi >= d + 0.2 * span) & (phi < d + 0.8 * span)
+
+    def v71_stance_mid(phi, v):
+        d = np.clip(np.array([v71_duty(x) for x in np.atleast_1d(v)])[:, None], 0.55, 0.70)
+        return (phi >= 0.15 * d) & (phi < 0.85 * d)
+
+    for name, prg_fn, v71_fn in (
+        ("target_height", prg_clock.target_height, v71_target_height),
+        ("swing_mid_mask", prg_clock.swing_mid_mask, v71_swing_mid),
+        ("stance_mid_mask", prg_clock.stance_mid_mask, v71_stance_mid),
+    ):
+        got = np.asarray(prg_fn(phi, v))
+        want = np.asarray(v71_fn(phi, v))
+        np.testing.assert_allclose(
+            np.asarray(got, dtype=float), np.asarray(want, dtype=float),
+            atol=1e-12, err_msg=name)
+    print("PASS test_reward_helpers_match_v71_module")
+
 if __name__ == "__main__":
     sys.exit(_main())

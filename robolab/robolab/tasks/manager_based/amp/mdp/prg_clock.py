@@ -171,6 +171,54 @@ def f_cmd_star(v):
 
 
 # ---------------------------------------------------------------------------
+# v71-mirrored per-phase target functions (used by the PRG reward terms).
+# Same semantics as mdp/gait_clock.py::{target_height, swing_mid_mask,
+# stance_mid_mask} but operating on an EXTERNAL phi array (the PRG state's
+# phase), so rewards can score against the ADAPTIVE clock instead of the
+# pure-time one. Bitwise-identical formulas.
+# ---------------------------------------------------------------------------
+def _col2(v):
+    """(N,) -> (N,1) column for broadcasting against (N,2) phi."""
+    if _is_torch(v):
+        return v[:, None]
+    return np.asarray(v)[:, None]
+
+
+def target_height(phi, v):
+    """Desired lowest-sole-point height z*(phi_i) per foot, shape (N, 2).
+
+    0 through the stance window; raised C0 bell peaking at h*(v) mid-swing
+    (v71 formula, evaluated at the PRG state's phi).
+    """
+    d = _clamp(_col2(duty_star(v)), PRG_D_LO, PRG_D_HI)
+    h = _clamp(_col2(h_star(v)), PRG_H_LO, PRG_H_HI)
+    frac = (phi - d) / _clamp(1.0 - d, 1e-6, 1.0)   # <0 stance, [0,1) swing
+    pi = _torch.pi if _is_torch(frac) else np.pi
+    sin = _torch.sin if _is_torch(frac) else np.sin
+    zeros = (_torch.zeros_like if _is_torch(frac) else np.zeros_like)
+    bell = sin(pi * _clamp(frac, 0.0, 1.0))
+    return _where(frac > 0.0, h * bell, zeros(bell))
+
+
+# hinge windows (fractions INSIDE each desired phase span) — v71 constants
+SWING_MID_LO, SWING_MID_HI = 0.2, 0.8     # of the swing span
+STANCE_MID_LO, STANCE_MID_HI = 0.15, 0.85  # of the stance span
+
+
+def swing_mid_mask(phi, v):
+    """True where the foot SHOULD be mid-swing (contact here = violation)."""
+    d = _clamp(_col2(duty_star(v)), PRG_D_LO, PRG_D_HI)
+    span = _clamp(1.0 - d, 1e-6, 1.0)
+    return (phi >= d + SWING_MID_LO * span) & (phi < d + SWING_MID_HI * span)
+
+
+def stance_mid_mask(phi, v):
+    """True where the foot SHOULD be mid-stance (airborne here = violation)."""
+    d = _clamp(_col2(duty_star(v)), PRG_D_LO, PRG_D_HI)
+    return (phi >= STANCE_MID_LO * d) & (phi < STANCE_MID_HI * d)
+
+
+# ---------------------------------------------------------------------------
 # PRG state machine
 # ---------------------------------------------------------------------------
 class PRGState:

@@ -149,8 +149,59 @@ def _retarget_scene_entity_names(cfg, body_map=X1_TO_G1_BODY_NAMES, _seen=None):
 
 @configclass
 class G1AmpEnvCfg(X1AmpEnvCfg):
+    # C1 PRG adaptive gait clock (G1AmpEnv reads these; set from env vars
+    # below). B0 baseline = both False (pure v71 clock via X1_GAIT_CLOCK=1).
+    prg_enabled: bool = False
+    prg_freq_mod: bool = False
+
     def __post_init__(self):
         super().__post_init__()
+
+        # --- C1 PRG wiring (single source: G1_PRG / G1_PRG_FREQ_MOD) ------
+        import os as _os
+        from .mdp import observations as _obs_mdp
+        from .mdp import rewards as _rew_mdp
+        _prg = _os.environ.get("G1_PRG", "0") == "1"
+        _fmod = _os.environ.get("G1_PRG_FREQ_MOD", "0") == "1" and _prg
+        self.prg_enabled = _prg
+        self.prg_freq_mod = _fmod
+        if _prg:
+            # 1) clock obs: PRG state clock (falls back to v71 inside the
+            #    func when the env has no PRG state, so the layout is stable)
+            _clock_params = dict(getattr(
+                getattr(self.observations.policy, "gait_clock", None), "params",
+                {}) or {})
+            if not _clock_params:
+                # X1_GAIT_CLOCK was off — create the obs terms ourselves
+                from isaaclab.managers import ObservationTermCfg as ObsTermV71
+                self.observations.policy.gait_clock = ObsTermV71(
+                    func=_obs_mdp.prg_clock_obs)
+                self.observations.critic.gait_clock = ObsTermV71(
+                    func=_obs_mdp.prg_clock_obs)
+            else:
+                self.observations.policy.gait_clock.func = _obs_mdp.prg_clock_obs
+                self.observations.critic.gait_clock.func = _obs_mdp.prg_clock_obs
+            # 2) clock rewards: PRG twins (identical kernels, PRG phase);
+            #    ensure nonzero weights even when X1_GAIT_CLOCK=0 (PRG is
+            #    its own switch — single-variable chain vs B0)
+            if getattr(self.rewards, "foot_clock", None) is not None:
+                self.rewards.foot_clock.func = _rew_mdp.prg_foot_clock_height
+                if self.rewards.foot_clock.weight == 0:
+                    self.rewards.foot_clock.weight = float(
+                        _os.environ.get("X1_FOOT_CLOCK_W", "1.0"))
+            if getattr(self.rewards, "contact_clock", None) is not None:
+                self.rewards.contact_clock.func = _rew_mdp.prg_contact_clock_timing
+                if self.rewards.contact_clock.weight == 0:
+                    self.rewards.contact_clock.weight = -float(
+                        _os.environ.get("X1_CONTACT_CLOCK_W", "0.5"))
+        # unconditional runtime-effectiveness audit (RECORD_BOOK lesson)
+        print(
+            f"[G1-PRG-CFG] prg_enabled={int(self.prg_enabled)} "
+            f"prg_freq_mod={int(self.prg_freq_mod)} "
+            f"PRG_RESET_MODE={_os.environ.get('PRG_RESET_MODE','hard')} "
+            f"obs_func={getattr(getattr(self.observations.policy, 'gait_clock', None), 'func', None)} "
+            f"foot_clock_func={getattr(getattr(self.rewards, 'foot_clock', None), 'func', None)}"
+        )
 
         # G1 robot (link/joint names are native G1; body-name differences in
         # the inherited stack are retargeted below)
