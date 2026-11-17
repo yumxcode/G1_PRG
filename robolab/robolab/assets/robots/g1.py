@@ -227,11 +227,16 @@ G1_CFG = ArticulationCfg(
             effort_limit_sim=25.0,
             velocity_limit_sim=37.0,
             # kp/kd: IsaacLab G1 29dof locomotion pattern [MED-HIGH]
+            # v2 fix (stand-probe TASK_20261117_376): shoulders at kp=40 let
+            # gravity swing the arms ~1 rad into the torso (illegal contact
+            # terminations mid-stand). Raise shoulders/elbows to the IsaacLab
+            # manipulation-class stiffness so the idle pose holds still; the
+            # POLICY still shapes arm motion via the action offsets.
             stiffness={
-                ".*_shoulder_pitch_joint": 40.0,
-                ".*_shoulder_roll_joint": 40.0,
-                ".*_shoulder_yaw_joint": 40.0,
-                ".*_elbow_joint": 40.0,
+                ".*_shoulder_pitch_joint": 100.0,
+                ".*_shoulder_roll_joint": 100.0,
+                ".*_shoulder_yaw_joint": 60.0,
+                ".*_elbow_joint": 80.0,
                 ".*_wrist_roll_joint": 20.0,
             },
             damping={
