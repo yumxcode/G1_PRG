@@ -50,17 +50,20 @@ cfg.sim.device = os.environ.get("G1_PROBE_DEVICE", "cuda:0")
 env = G1AmpEnv(cfg=cfg)
 
 N = int(os.environ.get("G1_STAND_STEPS", "100"))
+NOISE = float(os.environ.get("G1_STAND_NOISE", "0.0"))  # 1.0 = training-like
 obs, _ = env.reset()
 robot = env.scene["robot"]
 q0 = robot.data.default_joint_pos.clone()
+sensor = env.scene["contact_forces"]
 print(f"[STAND] q_default[:6]={q0[0, :6].tolist()}", flush=True)
 print(f"[STAND] root z0={robot.data.root_pos_w[0, 2].item():.4f} "
       f"joint names[:6]={robot.data.joint_names[:6]}", flush=True)
 
 fell = False
 for i in range(N):
-    obs, rew, term, trunc, info = env.step(torch.zeros(
-        env.num_envs, robot.data.joint_names.__len__(), device=env.device))
+    a = NOISE * torch.randn(
+        env.num_envs, len(robot.data.joint_names), device=env.device)
+    obs, rew, term, trunc, info = env.step(a)
     z = robot.data.root_pos_w[0, 2].item()
     qw = robot.data.root_quat_w[0, 0].item()
     q_err = (robot.data.joint_pos[0] - q0[0]).abs().max().item()
@@ -70,6 +73,18 @@ for i in range(N):
               f"rew={rew[0].item():.3f}", flush=True)
     if term[0]:
         fell = True
+        # identify WHICH body force triggered the illegal contact
+        try:
+            nf = sensor.data.net_forces_w[:, 0, :, :].norm(dim=-1)  # (N, B)
+            f0 = nf[0]
+            top = torch.topk(f0, k=6)
+            names = sensor.body_names
+            for idx, mag in zip(top.indices.tolist(), top.values.tolist()):
+                if mag > 1.0:
+                    print(f"[STAND] contact>1N: {names[idx]} = {mag:.1f}",
+                          flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[STAND] contact-dump failed: {e}", flush=True)
         break
 
 z_end = robot.data.root_pos_w[0, 2].item()
