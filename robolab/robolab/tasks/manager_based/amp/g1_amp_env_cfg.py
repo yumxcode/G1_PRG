@@ -50,6 +50,16 @@ X1_TO_G1_BODY_NAMES = {
     "right_wrist_roll_link": "right_wrist_yaw_link",
 }
 
+# Regex-pattern body names in the X1 stack (e.g. the base_contact
+# termination lists ".*_knee_.*_link"). Exact-name mapping cannot see
+# these; rewrite the whole pattern to its G1 equivalent (G1 bodies have no
+# *_pitch/_roll knee-elbow suffixes and no lumbar_* at all).
+X1_TO_G1_BODY_PATTERNS = [
+    (".*_knee_.*_link", ".*_knee_link"),
+    ("lumbar_.*_link", "(waist_yaw|waist_roll|torso)_link"),
+    (".*_elbow_.*_link", ".*_elbow_link"),
+]
+
 # X1 joint-name pattern -> G1 joint-name pattern (substitution rules; FIRST
 # matching rule wins so elbow_yaw->wrist_roll is not re-rewritten to wrist_yaw)
 X1_TO_G1_JOINT_RULES = [
@@ -123,11 +133,23 @@ def _retarget_scene_entity_names(cfg, body_map=X1_TO_G1_BODY_NAMES, _seen=None):
                 if val in body_map:
                     setattr(cfg, attr, body_map[val])
                     changed_bodies.append(f"{val}->{body_map[val]}")
+                elif any(c in val for c in ".*|"):
+                    for x1_pat, g1_pat in X1_TO_G1_BODY_PATTERNS:
+                        if val == x1_pat:
+                            setattr(cfg, attr, g1_pat)
+                            changed_bodies.append(f"{val}(re)->{g1_pat}")
+                            break
             elif isinstance(val, list):
                 for i, name in enumerate(val):
                     if isinstance(name, str) and name in body_map:
                         val[i] = body_map[name]
                         changed_bodies.append(f"{name}->{val[i]}")
+                    elif isinstance(name, str) and any(c in name for c in ".*|"):
+                        for x1_pat, g1_pat in X1_TO_G1_BODY_PATTERNS:
+                            if name == x1_pat:
+                                val[i] = g1_pat
+                                changed_bodies.append(f"{name}(re)->{g1_pat}")
+                                break
         elif attr in ("joint_names", "joint_names_expr"):
             if isinstance(val, str):
                 new = _retarget_joint_pattern(val)
