@@ -241,20 +241,18 @@ class G1AmpEnvCfg(X1AmpEnvCfg):
             if manager is not None:
                 _retarget_scene_entity_names(manager)
 
-        # base_contact REBUILT for G1 (post-retarget). TERM-DIAG evidence
-        # (TASK_20261118_013): envs die at death_z=0.797 m == STANDING
-        # height with base_contact 100% — the GMR primitive-collision URDF
-        # produces persistent >1 N SELF-collisions (pelvis-thigh, thigh-
-        # calf at the joints) that the X1 1 N threshold reads as a fall.
-        # Fix: falls are judged ONLY by pelvis/torso ground impacts with a
-        # 25 N threshold (a real fall slams >>25 N; self-collisions sit
-        # near 1-5 N). Hip/knee/arm contacts stay in undesired_contacts
-        # (reward-side) where magnitudes matter, not terminations.
-        self.terminations.base_contact.params["sensor_cfg"].body_names = [
-            "pelvis",
-            "torso_link",
-        ]
-        self.terminations.base_contact.params["threshold"] = 25.0
+        # base_contact DISABLED on G1; falls judged by POSE terminations.
+        # TERM-DIAG evidence chain (TASK_20261118_013/015): envs die at
+        # death_z = 0.797 m == STANDING height, base_contact 100% even at
+        # a 25 N threshold — the GMR primitive-collision URDF puts
+        # self-collisions (pelvis-thigh etc.) ON the load path, so their
+        # forces are BODY-WEIGHT class, not a few N. No contact threshold
+        # separates a fall from standing on this URDF. Pose criteria are
+        # immune: base_height (0.79 stand vs <0.45 fallen) and
+        # bad_orientation (>60 deg torso tilt). Contact QUALITY stays in
+        # the undesired_contacts reward.
+        self.terminations.base_contact.params["threshold"] = 1.0e9
+        self.terminations.base_height.params["minimum_height"] = 0.45
 
         # Discriminator key bodies: 10 role-identical G1 bodies (G1 demo
         # library pending; kept consistent for the future retarget schema).
