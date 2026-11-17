@@ -39,8 +39,18 @@ argv = [
 print(f"[G1-SMOKE] argv={argv}", flush=True)
 print(f"[G1-SMOKE] G1_PRG={os.environ['G1_PRG']} "
       f"PRG_RESET_MODE={os.environ['PRG_RESET_MODE']}", flush=True)
+# PYTHONPATH shadowing (no pip; X1 launcher convention): vendored rsl_rl
+# (AMPRunner lives here, not in the image's site-packages) + robolab source
+_parts = [str(_root / "rsl_rl"), str(_root / "robolab")]
+_old = os.environ.get("PYTHONPATH", "")
+if _old:
+    _parts.append(_old)
+env = dict(os.environ)
+env["PYTHONPATH"] = ":".join(_parts)
+print(f"[G1-SMOKE] PYTHONPATH shadowing: {env['PYTHONPATH']}", flush=True)
+
 # subprocess (not runpy): running train.py as a SCRIPT puts its own dir at
 # sys.path[0], so its sibling module `cli_args` imports — the X1 launcher
 # convention. Stream stdout/stderr straight through so the platform log
 # shows every audit print unbuffered.
-sys.exit(subprocess.call(argv, cwd=str(_root)))
+sys.exit(subprocess.call(argv, cwd=str(_root), env=env))
