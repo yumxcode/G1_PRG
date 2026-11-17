@@ -144,6 +144,15 @@ class G1AmpEnv(AmpEnv):
 
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_env_ids) > 0:
+            # [PRG] one-shot termination diagnostics (env 0..3) — which
+            # termination, root z, and top-contact bodies at the instant of
+            # death. PRINT_COUNT caps the spam; remove after diagnosis.
+            if getattr(self, "_term_diag_count", 0) < 40:
+                self._term_diag_count = getattr(self, "_term_diag_count", 0) + 1
+                term_now = self.termination_manager.get_term("base_contact")
+                z_now = self.scene["robot"].data.root_pos_w[:4, 2]
+                print(f"[TERM-DIAG] n={len(reset_env_ids)} base_contact={term_now[:4].tolist()} "
+                      f"z[:4]={z_now.tolist()}", flush=True)
             self.recorder_manager.record_pre_reset(reset_env_ids)
             self._reset_idx(reset_env_ids)
             self.scene.write_data_to_sim()
