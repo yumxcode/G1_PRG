@@ -166,6 +166,10 @@ G1_CFG = ArticulationCfg(
                 ".*_knee_joint": 20.0,
             },
             # kp/kd: unitree_rl_gym legs [HIGH] + waist-by-motor-class [MED]
+            # v2 damping fix (2026-11-17 smoke postmortem): unitree_rl_gym kd
+            # (2/4) targets IsaacGym direct-torque sim; on this IsaacSim
+            # DelayedPD stack the X1 v68 recipe needs ζ≈0.7 → kd 8 on all
+            # leg/waist joints (X1 120→65 kp / kd→8 was the same lesson).
             stiffness={
                 "waist_yaw_joint": 100.0,    # motor class of hip_yaw
                 "waist_roll_joint": 40.0,    # motor class of ankles
@@ -176,13 +180,13 @@ G1_CFG = ArticulationCfg(
                 ".*_knee_joint": 150.0,
             },
             damping={
-                "waist_yaw_joint": 2.0,
-                "waist_roll_joint": 2.0,
-                "waist_pitch_joint": 2.0,
-                ".*_hip_pitch_joint": 2.0,
-                ".*_hip_roll_joint": 2.0,
-                ".*_hip_yaw_joint": 2.0,
-                ".*_knee_joint": 4.0,
+                "waist_yaw_joint": 8.0,
+                "waist_roll_joint": 8.0,
+                "waist_pitch_joint": 8.0,
+                ".*_hip_pitch_joint": 8.0,
+                ".*_hip_roll_joint": 8.0,
+                ".*_hip_yaw_joint": 8.0,
+                ".*_knee_joint": 8.0,
             },
             # armature: unitree_rl_lab motor-catalog reflected inertia [MED]
             armature={
@@ -203,7 +207,10 @@ G1_CFG = ArticulationCfg(
             effort_limit_sim=50.0,
             velocity_limit_sim=37.0,
             stiffness=40.0,
-            damping=2.0,
+            damping={  # X1 ankle split: pitch ζ0.73 kd4, roll ζ0.93 kd2.5
+                ".*_ankle_pitch_joint": 4.0,
+                ".*_ankle_roll_joint": 2.5,
+            },
             armature=0.0036,  # 5020-16
             min_delay=0,
             max_delay=2,

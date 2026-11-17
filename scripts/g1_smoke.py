@@ -33,8 +33,8 @@ argv = [
     "--task=G1-AMP",
     "--headless",
     "--logger=tensorboard",
-    "--num_envs=1024",
-    "--max_iterations=100",
+    "--num_envs=" + os.environ.get("G1_SMOKE_ENVS", "1024"),
+    "--max_iterations=" + os.environ.get("G1_SMOKE_ITERS", "100"),
     "--run_name=g1_smoke_prg_c1a",
 ]
 print(f"[G1-SMOKE] argv={argv}", flush=True)
