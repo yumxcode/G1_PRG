@@ -1,0 +1,166 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# Copyright (c) 2025-2026, The RoboLab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+import os
+from dataclasses import MISSING
+from typing import Literal
+
+from isaaclab.utils import configclass
+
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoActorCriticRecurrentCfg, RslRlPpoAlgorithmCfg, RslRlSymmetryCfg
+from robolab import ROBOLAB_ROOT_DIR
+
+
+@configclass
+class RslRlAmpCfg:
+    """Configuration class for the AMP (Adversarial Motion Priors) in the training."""
+
+    disc_obs_buffer_size: int = 1000
+    grad_penalty_scale: float = 10.0
+    disc_trunk_weight_decay: float = 1.0e-4
+    disc_linear_weight_decay: float = 1.0e-2
+    disc_learning_rate: float = 1.0e-5
+    disc_max_grad_norm: float = 1.0
+
+    @configclass
+    class AMPDiscriminatorCfg:
+        hidden_dims: list[int] = MISSING
+        activation: str = "elu"
+        style_reward_scale: float = 1.0
+        task_style_lerp: float = 0.0
+
+    amp_discriminator: AMPDiscriminatorCfg = AMPDiscriminatorCfg()
+    loss_type: Literal["GAN", "LSGAN", "WGAN"] = "LSGAN"
+
+
+@configclass
+class RslRlPpoActorCriticConv2dCfg(RslRlPpoActorCriticCfg):
+    class_name: str = "ActorCriticConv2d"
+    conv_layers_params: list[dict] = [
+        {"out_channels": 4, "kernel_size": 3, "stride": 2},
+        {"out_channels": 8, "kernel_size": 3, "stride": 2},
+        {"out_channels": 16, "kernel_size": 3, "stride": 2},
+    ]
+    conv_linear_output_size: int = 16
+
+
+@configclass
+class RslRlPpoAmpAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    class_name: str = "PPOAmp"
+    amp_cfg: RslRlAmpCfg = RslRlAmpCfg()
+
+
+@configclass
+class X1RslRlOnPolicyRunnerAmpCfg(RslRlOnPolicyRunnerCfg):
+    """X1 AMP runner config — symmetry DISABLED (29 DOF mirror indices TBD)."""
+    class_name = "AMPRunner"
+    num_steps_per_env = 24
+    # v18: 3000 -> 4000. v16/v17 curves plateaued (lin kernel 0.835-0.839);
+    # extra 1000 iters to close the gap toward the 0.85 TARGET (AMP_ACCEPTANCE.md).
+    max_iterations = 4000
+    # v26: 4000 -> 1000. v25 lesson (exp_mt839s7k): save_interval=4000 stores
+    # ONLY the endpoint, so an external kill at iter 3458 destroyed all
+    # training progress with the pod. Disk ckpts (logs/ tree) never touch the
+    # SDK registration quota — that budget is managed by explicit mirroring
+    # in run_x1_amp_train.py (anchor + retarget x2 + model_2000 + model_3999).
+    # v29e4: 1000 -> 500. Fine-tune runs (+1000 iters) produce their FIRST
+    # (and on 1000, ONLY) save at the very end — v29e3's model_10496 landed
+    # ~7 min before pod death and the SDK scan missed it. 500 gives a
+    # mid-run save (model_10000 on a 9497-resume) that registers with ample
+    # margin, independent of the end-of-task scan window.
+    save_interval = 500
+    experiment_name = "x1_amp"
+    wandb_project = "x1_amp"
+    obs_groups = {
+        "policy": ["policy"],
+        "critic": ["critic"],
+        "discriminator": ["disc"],
+        "discriminator_demonstration": ["disc_demo"]
+    }
+    policy = RslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        activation="elu",
+    )
+    algorithm = RslRlPpoAmpAlgorithmCfg(
+        class_name="PPOAMP",
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        symmetry_cfg=None,  # DISABLED: X1 29-DOF mirror indices not yet implemented
+        amp_cfg=RslRlAmpCfg(
+            # v63: X1_DISC_BUFFER — the CircularBuffers store (max_len,
+            # num_envs, disc_frames, dim) per step; with the 600 ms window
+            # (30 strided frames x 124 dims) the v61 default 100 would need
+            # 100*4096*30*124*4 B = 6.1 GB PER BUFFER (x2 = 12.2 GB, OOM on
+            # the 4090D 24G). 24 == num_steps_per_env (the minibatch
+            # fetch_length) is the exact requirement and brings both buffers
+            # to 2.9 GB total (v62b baseline: 2.4 GB at 6x121).
+            disc_obs_buffer_size=int(
+                __import__("os").environ.get("X1_DISC_BUFFER", "100")),
+            grad_penalty_scale=float(
+                __import__("os").environ.get("X1_GP_SCALE", "10.0")),
+            disc_trunk_weight_decay=1.0e-3,
+            disc_linear_weight_decay=1.0e-1,
+            disc_learning_rate=float(
+                __import__("os").environ.get("X1_DISC_LR", "1.0e-4")),
+            disc_max_grad_norm=1.0,
+            amp_discriminator=RslRlAmpCfg.AMPDiscriminatorCfg(
+                hidden_dims=[1024, 512],
+                activation="elu",
+                # v39: 1.5 -> 2.5. With wrists/shoulders IN the disc
+                # observation (v38), style score now CORRELATES with arm
+                # form (v33b 2.00/collapsed was the blind-disc regime;
+                # v38 0.562 with better scoring). Amplify the now-informative
+                # channel. Revert to 1.5 if P3a < 0.80 or P7 fails.
+                # v61: predict_style_reward multiplies by dt (=1/hz), so the
+                # per-step style reward halves at 100 Hz while task terms
+                # stay per-step — task_style_lerp then drifts off its 50Hz
+                # calibration. Scale back up with the control rate so the
+                # style:task balance per step (and per sim-time) is unchanged.
+                # beyondmimic phase A (sec 10 route 1): X1_STYLE_SCALE=0
+                # turns the style reward OFF (tracking-dominant training);
+                # default 2.5 = byte-identical champion recipe.
+                style_reward_scale=float(__import__("os").environ.get("X1_STYLE_SCALE", "2.5")) * (int(__import__("os").environ.get("X1_CONTROL_HZ", "50")) / 50.0),
+                # v35: 0.6 -> 0.7. History: v21 tested 0.75 (lin +0.003
+                # noise-level, style halved 0.335->0.146 -> P5a FAIL), settled
+                # on 0.6. Today's regime differs: the v31 dataset rebuild made
+                # style reward 1.14-2.00 (deep saturation, tiny marginal
+                # gradient) while lin kernel dropped to 0.78 (v27/v28: 0.84 on
+                # the old data) — the trade point moved. 0.7 targets P3a
+                # recovery; P5a floor 0.15 retains ~8x margin even if style
+                # halves again. Revert to 0.6 if P5a < 0.3 or arm form (P7)
+                # regresses.
+                # v42: 0.65 -> 0.68 (audit item T1): v38-v41 ran 0.65 and
+                # the lin kernel sat at 0.834-0.844 (T1 target 0.85);
+                # v36's clean-phase peak was 0.864. Nudge the task mix up
+                # while keeping style well above its floor (v39-v41 style
+                # 0.94-1.07 at 0.65 — ample margin above P5a 0.15).
+                task_style_lerp=float(
+                    __import__("os").environ.get("X1_TASK_LERP", "0.68"))
+                # v61f: X1_TASK_LERP=0 removes the style channel from the
+                # reward entirely. v61b/c/d2/e forensics (corrected
+                # arithmetic): the micro-gait's style income is ~2.7x the
+                # 50 Hz champion's PER SECOND (5.4e-3 vs 2.0e-3) — the
+                # re-trained disc equilibrium at 100 Hz ACTIVELY REWARDS
+                # micro-stepping, it is not dead. Single-variable test:
+                # task+guards+prior only (prior stays 0.12 via X1_ARM_PRIOR).
+            ),
+            loss_type="LSGAN"
+        ),
+    )

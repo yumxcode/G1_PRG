@@ -1,0 +1,1938 @@
+import math
+import os
+import numpy as np
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils import configclass
+
+import robolab.tasks.manager_based.amp.mdp as mdp
+from robolab.tasks.manager_based.amp.amp_env_cfg import AmpEnvCfg
+from robolab.assets.robots.x1 import X1_CFG
+from robolab import ROBOLAB_ROOT_DIR
+
+# NOTE: KEY_BODY_NAMES must match lab_key_body_names in scripts/tools/retarget/config/x1.yaml
+# v30 FIX: order was [ankles, knees] while the yaml/pkl schema is [knees, ankles].
+# The discriminator compared policy key_body_pos_b (env order) against
+# ref_key_body_pos_b (pkl schema order) with columns 0-3 PERMUTED between the
+# two domains since v16 -> ankle channels were matched against reference KNEES.
+# v38: extended 6 -> 10 — the discriminator could not SEE the arms (only
+# knee/ankle/elbow endpoints), which is the structural reason style score
+# never shaped arm swing (v33b style 2.00 with collapsed arms vs v37 0.80
+# with good form). Added L/R shoulder_pitch (upper-arm proximal) + L/R
+# wrist_pitch (distal endpoint = direct swing-amplitude channel). The v32
+# dataset recomputes all 10 columns from each clip's dof via MuJoCo FK
+# (uniform provenance, gate <= 1.2 mm vs stored).
+KEY_BODY_NAMES = [
+    "left_knee_pitch_link",
+    "right_knee_pitch_link",
+    "left_ankle_roll_link",
+    "right_ankle_roll_link",
+    "left_elbow_yaw_link",
+    "right_elbow_yaw_link",
+    "left_shoulder_pitch_link",
+    "right_shoulder_pitch_link",
+    "left_wrist_pitch_link",
+    "right_wrist_pitch_link",
+]
+ANIMATION_TERM_NAME = "animation"
+# v61c: disc/animation temporal window in control steps. At 50 Hz the
+# recipe's 3 steps = 60 ms of gait context. v61b ran 100 Hz with 3 steps
+# (30 ms) and the style channel's AMPLITUDE discrimination collapsed
+# (arm swing 34.7 -> 14.5/10.8 deg, swing height < 12 mm drag-walk) while
+# stability/kernel/drift all passed — the pre-registered falsification of
+# "same step count suffices". X1_AMP_NUM_STEPS restores the 60 ms window
+# (6 steps at 100 Hz). Disc-obs expansion on resume re-inits via the
+# amp_runner component-level shape path (v38 lesson).
+AMP_NUM_STEPS = int(__import__("os").environ.get("X1_AMP_NUM_STEPS", "3"))
+
+# v40: joint sets for the legs-vs-arms smoothing-penalty split. MUST live
+# at MODULE level — a SceneEntityCfg attribute inside the @configclass
+# class body breaks disable_zero_weight_rewards(), which walks every
+# attribute expecting a RewTerm (.weight) and crashed v40 at startup
+# (TASK_20260914_035: AttributeError 'SceneEntityCfg' has no 'weight').
+
+
+
+@configclass
+class X1AmpRewards():
+    """Reward terms for AMP — mirrors RPO AMP reward structure."""
+
+    # -- Task
+    track_lin_vel_xy_exp = RewTerm(
+        func=mdp.track_lin_vel_xy_exp,
+        weight=0,
+        params={"command_name": "base_velocity", "std": 0.5},
+    )
+    track_ang_vel_z_exp = RewTerm(
+        func=mdp.track_ang_vel_z_exp, weight=0, params={"command_name": "base_velocity", "std": 0.5}
+    )
+
+    # -- Alive
+    alive = RewTerm(func=mdp.is_alive, weight=0)
+
+    # -- Base Link
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=0)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=0)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=0)
+
+    # -- Joint
+    joint_vel_l2 = RewTerm(func=mdp.joint_vel_l2, weight=0)
+    # v40: acc/rate smoothing split legs-vs-arms (halved on arms — see
+    # the *_arms terms below). Base terms cover legs+torso ONLY (17
+    # joints) so the arm channels are not double-penalized.
+    joint_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=0,
+                           params={"asset_cfg": SceneEntityCfg(
+                               "robot", joint_names=[".*(hip|knee|ankle|lumbar).*_joint"])})
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2_joints, weight=0,
+                             params={"asset_cfg": SceneEntityCfg(
+                                 "robot", joint_names=[".*(hip|knee|ankle|lumbar).*_joint"])})
+    # v40: arm-channel HALVED smoothing penalties. Arm swing fell across
+    # three disc-led runs (29.7 -> 21.7 -> 18.7 deg) even with wrists
+    # visible to the disc and style scale 2.5 — the style gradient toward
+    # reference-like arm swing (92/83 deg) is outweighed by the flat
+    # smoothing penalties applied to all 29 joints equally.
+    joint_acc_l2_arms = RewTerm(
+        func=mdp.joint_acc_l2, weight=0,
+        params={"asset_cfg": SceneEntityCfg(
+            "robot", joint_names=[".*_(shoulder|elbow|wrist)_.*joint"])})
+    action_rate_l2_arms = RewTerm(
+        func=mdp.action_rate_l2_joints, weight=0,
+        params={"asset_cfg": SceneEntityCfg(
+            "robot", joint_names=[".*_(shoulder|elbow|wrist)_.*joint"])})
+    smoothness_1 = RewTerm(func=mdp.smoothness_1, weight=0)
+    joint_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0)
+    joint_energy = RewTerm(func=mdp.joint_energy, weight=0)
+    joint_regularization = RewTerm(func=mdp.joint_deviation_l1, weight=0)
+    # v34: in-phase swing detector on HIGH-PASSED residuals (|hpL + hpR|).
+    # History: v28b |devL-devR| penalized natural antiphase (-> sync arms);
+    # v32's |devL+devR| sum turned out to tax the reference's joint-space
+    # shared DC (-26 deg -> -0.137/step on ref vs -0.005 on frozen arms,
+    # composite audit 2026-09-11) and helped collapse v33b arm swing to
+    # 4-8 deg. Residual version: zero on antiphase at any amplitude, large
+    # on in-phase swing, no DC sensitivity (see mdp.arm_sync_residual).
+    arm_pitch_sync = RewTerm(
+        func=mdp.arm_sync_residual,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"],
+                preserve_order=True,
+            )
+        },
+    )
+    # v33/v34: frozen ANTISYMMETRIC arm offset guard (v32b defect: L -9 /
+    # R +9.8 deg held). v34 slows the EMA to alpha=0.0025 (tau 8 s): at
+    # alpha=0.02 the 1 Hz antiphase AC leaked ~28 deg into the EMA and the
+    # guard taxed swing amplitude (ref scored -0.0998/step).
+    arm_asym_lean = RewTerm(
+        func=mdp.paired_joints_deviation_difference_ema_l1,
+        weight=0,
+        params={
+            "alpha": 0.0025,
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"],
+                preserve_order=True,
+            )
+        },
+    )
+    # v33/v34: arm/opposite-leg coordination (refs corr +0.8..+0.99; v32b
+    # -0.12). v34 fixes: (a) high-passed product — the raw-deviation product
+    # cancelled via DC cross-terms (scored ~0 on ref); (b) the R-shoulder x
+    # L-hip product is NEGATED — that pair carries the opposite joint-space
+    # sign (measured corr -0.98 on refs; shoulder pair same-sign, hip pair
+    # anti-aligned). v33 shipped without the negation so the two products
+    # (+0.105/-0.105 on ref) mutually cancelled. Ref now +0.031/step;
+    # collapsed arms ~+0.001 (small anti-collapse gradient toward natural
+    # coordinated swing).
+    arm_leg_coupling = RewTerm(
+        func=mdp.arm_opposite_leg_coupling,
+        weight=0,
+        params={
+            "shoulder_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"],
+                preserve_order=True,
+            ),
+            "hip_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["right_hip_pitch_joint", "left_hip_pitch_joint"],
+                preserve_order=True,
+            ),
+        },
+    )
+    # v33: chest posture (FK: +lumbar_pitch = chest forward; refs mean
+    # +14.9 deg; v32b sat at -9 deg backward).
+    lumbar_posture = RewTerm(
+        func=mdp.lumbar_pitch_prior,
+        weight=0,
+        params={
+            "target": 0.26,
+            # v33b BUG FIX: without an explicit asset_cfg the term indexed
+            # joint_ids[0] of ALL 29 joints (a mystery leg joint got pulled
+            # toward 0.26 rad; the v33 run degenerated into side-walking
+            # with the left hip held at +42 deg as compensation — root y
+            # drift 6.27 m at iter 2500, hip ratio 0.27, lumbar_pitch
+            # itself never moved from -10 deg. ALWAYS pin joint_names in
+            # single-joint reward terms.)
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["lumbar_pitch_joint"]),
+        },
+    )
+    # v39: hip swing-AMPLITUDE symmetry guard — v38 (disc obs 10 bodies)
+    # regressed walk10 hip ratio 0.823 -> 0.694 and walk05 0.755; the
+    # mirrored dataset gives a symmetric prior but nothing penalized
+    # asymmetric amplitudes under the new style gradient. Slow EMA (tau 8s)
+    # of |dev| envelopes; ref penalty ~0 at any phase structure.
+    # v52: flat amplitude prior (kept for A/B history; superseded in v55)
+    arm_amp_prior = RewTerm(
+        func=mdp.arm_swing_amplitude_prior,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"],
+                preserve_order=True),
+            "alpha": 0.02, "lo": 0.52, "hi": 0.79,
+        },
+    )
+    # v55: PHASE-LOCKED amplitude prior — amplitude scores only when the
+    # arm swing is antiphase-coherent with the opposite hip (gate on the
+    # instantaneous product, the arm_leg_coupling pairing). Fixes the
+    # v52/v53 dual failure (amplitude-vs-phase/DC trade).
+    arm_amp_phase = RewTerm(
+        func=mdp.arm_amp_phase_prior,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint",
+                             "left_hip_pitch_joint", "right_hip_pitch_joint"],
+                preserve_order=True),
+            "alpha": 0.02, "lo": 0.52, "hi": 0.79,
+        },
+    )
+    # v56: STRAIGHT-KNEE stance prior (human-gait arc, K1/K2 gates).
+    # Element-wise foot-stance x knee-angle pairing — explicit ordered
+    # body/joint lists (the v33b indexing lesson; see the func docstring
+    # for the numeric calibration: 36 deg -> 0.12, 15 deg -> 1.0).
+    knee_extension = RewTerm(
+        func=mdp.knee_extension_stance,
+        weight=0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_knee_pitch_joint", "right_knee_pitch_joint"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            "max_cmd_speed": 1.5,
+            "target": 0.26,
+            "sigma": 0.17,
+        },
+    )
+    # v57: HEEL-STRIKE prior (human-gait arc, H1/H3 gates) — geometric
+    # lead classification at the stance rising edge (+1.0 heel-first /
+    # +0.3 flat / 0 toe-first), sharing the corrected heel=+z_local
+    # convention with the K/H eval metric. Paired with the phased
+    # stance_sole_flat_walk rework (one coupled variable per GOAL §5).
+    heel_first = RewTerm(
+        func=mdp.heel_first_stance,
+        weight=0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            "max_cmd_speed": 1.5,
+            "touch_z": 0.010,
+            "lead_z": 0.002,
+        },
+    )
+    leg_amp_asym = RewTerm(
+        func=mdp.leg_amp_asym,
+        weight=0,
+        # v43->v44: extended hip pair -> hip+knee pairs (walk05 knee 0.745
+        # and back05 hip 0.697 missed the 0.85 gate under the kernel
+        # regime — same defect family, consecutive L/R pairs)
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                # v57d: + ankle pitch pairs (v44 precedent: same guard
+                # family, consecutive-pair extension — v57c's L/R landing
+                # asymmetry (L toe-first 33% vs R 95%) coupled into
+                # +4-5 m drift)
+                joint_names=["left_hip_pitch_joint", "right_hip_pitch_joint",
+                             "left_knee_pitch_joint", "right_knee_pitch_joint",
+                             "left_ankle_pitch_joint", "right_ankle_pitch_joint"],
+                preserve_order=True),
+            "alpha": 0.0025,
+        },
+    )
+    # v64c: PHASE-LOCKED hip kinematic reference — the rhythm ANCHOR
+    # (see func docstring: v64/v64b scalar priors did not cross the
+    # single-support balance basin; this term names the trajectory).
+    # Weight via X1_HIP_PHASE (default 0 = off).
+    hip_phase = RewTerm(
+        func=mdp.hip_phase_reference_prior,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_hip_pitch_joint", "right_hip_pitch_joint"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            "leg_len_m": 0.70,
+            "sigma_rad": 0.15,
+            "t_star_a": 1.46,
+            "t_star_b": 0.36,
+            "t_star_lo": 0.70,
+            "t_star_hi": 1.75,
+            "amp_lo_rad": 0.15,
+            "amp_hi_rad": 0.50,
+            "min_cmd_speed": 0.15,
+            "max_cmd_speed": 1.5,
+        },
+    )
+
+    # v57e: DENSE heel-down readiness prior — the flick's direct
+    # opponent (see func docstring for the v57d verdict: event rewards
+    # saturate in-domain while the last-100ms snap survives; this term
+    # has gradient at every low-swing frame instead).
+    heel_down_ready = RewTerm(        func=mdp.heel_down_ready,
+        weight=0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            "max_cmd_speed": 1.5,
+            "height_z": 0.040,
+        },
+    )
+    # v57d: terminal-swing ankle-FLICK penalty — the measured heel-toe
+    # blocker (policies snap +95-110 deg/s plantarflexion in the last
+    # 100 ms pre-contact; refs approach at -18..+38). Positive-excess
+    # relu only (dorsiflexion stays free); active while foot < 40 mm
+    # and airborne. See the func docstring for calibration.
+    # v60: SWING CLEARANCE FLOOR (posture-clearance joint round) — see
+    # the func docstring for the drag-family forensics and calibration.
+    swing_clearance = RewTerm(
+        func=mdp.swing_clearance_floor,
+        weight=0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            "max_cmd_speed": 1.5,
+            "floor_z": 0.012,
+        },
+    )
+    ankle_flick = RewTerm(
+        func=mdp.terminal_swing_ankle_rate,
+        weight=0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_ankle_pitch_joint", "right_ankle_pitch_joint"],
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            "max_cmd_speed": 1.5,
+            "height_z": 0.040,
+            "rate_thr": 0.70,
+        },
+    )
+    joint_torques_l2 = RewTerm(
+        func=mdp.joint_torques_l2,
+        weight=0.0,
+    )
+
+    # -- v69 gait-posture guards (user defect spec 2026-10-15) -----------
+    # D1 外八 both layers: whole-leg hip_roll abduction + foot toe-out.
+    # The discriminator cannot see either (key-body positions are nearly
+    # invariant under hip yaw; the demo library itself carries a mild
+    # right-foot toe-out bias of +6..14 deg that the policy amplified).
+    foot_yaw_neutral = RewTerm(
+        func=mdp.foot_yaw_neutral,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            "band_rad": 0.105,          # 6 deg
+        },
+    )
+    hip_roll_abduction = RewTerm(
+        func=mdp.hip_roll_abduction_guard,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_hip_roll_joint", "right_hip_roll_joint"],
+                preserve_order=True,
+            ),
+            "band_rad": 0.07,           # 4 deg
+            "alpha": 0.0025,
+        },
+    )
+    # -- v70 arm-posture guard (user defect spec 2026-10-15 rev2) ---------
+    # 右臂小臂内折 (right forearm folds inward across the chest via a
+    # held shoulder_yaw DC, penetrating the torso by up to 61 mm at swing
+    # in soup69_drift). Demos hold shoulder_yaw ~0 in every clip.
+    shoulder_yaw_fold = RewTerm(
+        func=mdp.shoulder_yaw_fold_guard,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_shoulder_yaw_joint", "right_shoulder_yaw_joint"],
+                preserve_order=True,
+            ),
+            "band_rad": 0.262,          # 15 deg
+        },
+    )
+    # -- v70b shared arm-lean guard (P7h regression on the v70 ladder) ---
+    # Once sy was banded the policy re-solved the arm redundancy via
+    # shoulder adduction: shared forward lean 7 -> 19-20 deg (P7h <= 12).
+    # arm_asym_lean guards the antisymmetric DC only (P7g passes).
+    arm_shared_lean = RewTerm(
+        func=mdp.arm_shared_lean_guard,
+        weight=0,
+        params={
+            "shoulder_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_shoulder_pitch_link", "right_shoulder_pitch_link"],
+                preserve_order=True,
+            ),
+            "elbow_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_elbow_pitch_link", "right_elbow_pitch_link"],
+                preserve_order=True,
+            ),
+            "band_rad": 0.105,         # 6 deg (walking demos 0.1-3.7)
+        },
+    )
+    # v80: COMPLETE arm DC anchor (user defect 2, 2026-10-26 -- arms held
+    # up/out). All four arm joints per side banded simultaneously (the
+    # v77-v79 single-statistic guards left DC freedom to re-solve into).
+    # Bands rad: shoP (0, 25deg), shoR (0, 20deg), shoY (0, 15deg),
+    # elbow (20deg, 40deg) -- demo-library means all inside; m5500 defect
+    # (shoR -74/shoP -54/elbow 70) pays ~1.9 rad. See mdp.arm_dc_band_guard.
+    arm_dc_band = RewTerm(
+        func=mdp.arm_dc_band_guard,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+                             "left_shoulder_yaw_joint", "left_elbow_pitch_joint",
+                             "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+                             "right_shoulder_yaw_joint", "right_elbow_pitch_joint"],
+                preserve_order=True),
+            "bands": [(0.0, 0.4363), (0.0, 0.3491), (0.0, 0.2618), (0.3491, 0.6981)] * 2,
+            "alpha": 0.0025,
+        },
+    )
+    # v95: QUIET-HANDS guard (user defect 2026-10-30: 手臂摆动别扭).
+    # SWING-amplitude bands on the distal arm joints — the demo library is
+    # a rigid shoP pendulum (shoY/elbowP/elbowY/wrists frozen 36/36, shoR
+    # 2-7 deg RMS); x7398 pumps them at gait frequency instead (shoY RMS
+    # 9-14 deg etc., hand sweep 0.56 m). arm_dc_band anchors DC only; the
+    # disc is blind (zero-variance demo channels). Bands rad RMS cover the
+    # max demo: shoR 7.3 / wriP 8.8 / wriR 7.1 deg. Dose via X1_ARM_QUIET_W
+    # (default 0 = off, byte-identical).
+    arm_distal_amp = RewTerm(
+        func=mdp.arm_distal_amp_guard,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+                             "left_elbow_pitch_joint", "left_elbow_yaw_joint",
+                             "left_wrist_pitch_joint", "left_wrist_roll_joint",
+                             "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+                             "right_elbow_pitch_joint", "right_elbow_yaw_joint",
+                             "right_wrist_pitch_joint", "right_wrist_roll_joint"],
+                preserve_order=True),
+            "bands": [0.14, 0.05, 0.05, 0.05, 0.16, 0.13] * 2,
+            "alpha": 0.02, "dc_alpha": 0.0025,
+        },
+    )
+    # v95c: AMP-under-ANTIPHASE prior (audit item 2, RECORD_BOOK 14.5).
+    # shoP min(L,R) swing-amplitude band gated by the L/R sync residual
+    # RMS(hpL+hpR) — demos sync 5-13 deg / policies 17-25 deg with walk05
+    # amplitude asymmetry. v55's arm_amp_phase has a sign cancellation on
+    # the natural demos (see mdp.arm_amp_antiphase_prior docstring).
+    # Dose via X1_AMP_ANTI_W (default 0 = off, byte-identical).
+    arm_amp_anti = RewTerm(
+        func=mdp.arm_amp_antiphase_prior,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"],
+                preserve_order=True),
+            "alpha": 0.02, "lo": 0.52, "hi": 0.79, "sync_cap": 0.24,
+        },
+    )
+    # v81: HIP-YAW DC band (residual of the v80 arc: with foot heading pinned
+    # to ~0 the policy still holds +-16 deg external hip_yaw DC, feet
+    # compensated forward via the ankle chain -- F3 gate fail). Same generic
+    # EMA-band statistic as arm_dc_band_guard, band (0, 8 deg) per leg.
+    hip_yaw_neutral = RewTerm(
+        func=mdp.arm_dc_band_guard,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_hip_yaw_joint", "right_hip_yaw_joint"],
+                preserve_order=True),
+            "bands": [(0.0, 0.1396)] * 2,
+            "alpha": 0.0025,
+        },
+    )
+    # v83: STANCE-WIDTH hinge (user defect spec 2026-10-27: feet walk
+    # severely wider than shoulder width). EMA(tau 1 s) of root-frame foot
+    # separation, LINEAR hinge beyond 0.32 m -- the exp bonus band is flat
+    # at the defect level (see mdp.stance_separation_hinge docstring for
+    # the FK-wipe attribution: hip_roll ~157 + hip_yaw ~103 + hip_pitch
+    # ~81 mm). Dose via X1_STANCE_HINGE_W (FORM package block).
+    stance_separation_hinge = RewTerm(
+        func=mdp.stance_separation_hinge,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "max": 0.32,
+            "alpha": 0.02,
+        },
+    )
+    # v91: ANALYTIC STEP-LENGTH DRIVE (RECORD_BOOK 12.12, lever B2 of the
+    # operator adjudication menu): at each foot touchdown, exp kernel on
+    # |step - v_cmd/(1.86 x f_clk)| — sets the step target analytically,
+    # bypassing the style anchor that pinned 0.446-0.453 across all seven
+    # lever families. Dose via X1_STEP_DRIVE_W (FORM package block).
+    step_length_clock = RewTerm(
+        func=mdp.step_length_clock,
+        weight=0,
+        params={
+            "command_name": "base_velocity",
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]),
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True),
+            "speed_ratio": 1.86,
+            "sigma": 0.05,
+        },
+    )
+    # v94: CHEST LEAN GUARD (RECORD_BOOK 13 — the 腰后仰 fix). Heading-frame
+    # tilt of base->shoulder-mid; free hinge band [0, +20 deg] (demo stream
+    # +2..+11); the q4499 delivery pins at -10 deg (chest BACKWARD) which
+    # the discriminator cannot see and lumbar_posture (-0.4, joint-space)
+    # fails to move. Dose via X1_CHEST_LEAN_W (default 0 = off).
+    chest_lean = RewTerm(
+        func=mdp.chest_lean_guard,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_shoulder_pitch_link", "right_shoulder_pitch_link"],
+                preserve_order=True,
+            ),
+            "lo": 0.0,
+            "hi": 0.35,
+        },
+    )
+    # v70f: frame-synced demo joint tracking (the persistent rhythm
+    # anchor; needs X1_DEMO_RESET_P=1.0 stashing + X1_DISC_VMATCH=1).
+    demo_joint_track = RewTerm(
+        func=mdp.demo_joint_tracking_exp,
+        weight=0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_hip_pitch_joint", "right_hip_pitch_joint",
+                             "left_knee_pitch_joint", "right_knee_pitch_joint"],
+                preserve_order=True,
+            ),
+            "std_rad": 0.35,
+            "command_name": "base_velocity",
+            "min_cmd_speed": 0.3,
+            "max_cmd_yaw": 0.5,
+        },
+    )
+    # D2/D3 腰摆泵动: lumbar roll/yaw AC + hip_roll AC (the lateral pump
+    # that carries the arms — see lateral_sway_guard docstring).
+    lateral_sway = RewTerm(
+        func=mdp.lateral_sway_guard,
+        weight=0,
+        params={
+            "lumbar_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["lumbar_roll_joint", "lumbar_yaw_joint"],
+                preserve_order=True,
+            ),
+            "hip_roll_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["left_hip_roll_joint", "right_hip_roll_joint"],
+                preserve_order=True,
+            ),
+            "alpha": 0.01,
+        },
+    )
+    # v71: EXOGENOUS GAIT CLOCK rewards (acceptance/X1_GAIT_SPEC_V71.md).
+    # foot_clock = per-foot swing-height tracking of the clock bell z*(phi)
+    #              (dense; the 抬腿 + touchdown-timing anchor);
+    # contact_clock = hinge penalty on contact during desired mid-swing /
+    #                 airborne during desired mid-stance (anti-drag/anti-tap).
+    # Weights default 0 — every earlier recipe byte-identical unless
+    # X1_GAIT_CLOCK=1 (weights then read from X1_FOOT_CLOCK_W/-X1_CONTACT_CLOCK_W).
+    foot_clock = RewTerm(
+        func=mdp.foot_clock_height,
+        weight=0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            # v71d knob: sharpening targets the brief-apex-pass defect
+            # (swing 0.145s vs 0.28 gate — partial credit at 0.03 lets the
+            #  foot touch the apex then land early; 0.02 prices the flanks)
+            "sigma_z": float(__import__("os").environ.get("X1_FOOT_SIGMA_Z", "0.03")),
+        },
+    )
+    contact_clock = RewTerm(
+        func=mdp.contact_clock_timing,
+        weight=0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+        },
+    )
+
+    # v63: RHYTHM prior — speed-conditioned human gait-cycle cadence
+    # (GOAL_RHYTHM.md). Event reward at each stance rising edge:
+    # exp(-|dt_td - T*(v)| / 0.25), T*(v)=clamp(1.46-0.36v, 0.70, 1.75).
+    # Calibrated on the retargeted reference set (36_01 1.03 s @1.0 m/s,
+    # 0002 slow 1.48 s, 36_11 1.63-1.83 s @0.43) + human literature.
+    # Weight via X1_CADENCE_PRIOR (default 0 = off, single-variable A/B).
+    gait_period = RewTerm(
+        func=mdp.gait_period_prior,
+        weight=0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            "sigma_s": 0.25,
+            "t_star_a": 1.46,
+            "t_star_b": 0.36,
+            "t_star_lo": 0.70,
+            "t_star_hi": 1.75,
+            "min_cmd_speed": 0.15,
+        },
+    )
+
+    # v64b: DENSE swing-duration prior (the anti-drag complement to
+    # gait_period — see the func docstring for the v64@0.6 forensics:
+    # event-prior credit gap + drag immunity drove a full drag regression
+    # in sim2sim). t_sw*=0.43 s = P8 reference swing median.
+    swing_airtime = RewTerm(
+        func=mdp.swing_airtime_prior,
+        weight=0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            "t_sw_s": 0.43,
+            "sigma_s": 0.15,
+            "min_cmd_speed": 0.15,
+            "max_cmd_speed": 1.5,
+        },
+    )
+
+    # -- v27: strict gait quality (sim2sim criteria) ---------------------
+    # sole must stay flat during stance at walking speeds (no toe-walk /
+    # ball-foot); see stance_sole_flat_walk docstring for the frame trap that
+    # rules out the built-in feet_orientation_l2 on X1.
+    stance_sole_flat = RewTerm(
+        func=mdp.stance_sole_flat_walk,
+        weight=0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll_link"),
+            "command_name": "base_velocity",
+            "max_cmd_speed": 1.5,
+        },
+    )
+
+    # -- Feet
+    feet_slide = RewTerm(
+        func=mdp.feet_slide,
+        weight=0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll_link"),
+        },
+    )
+
+    feet_distance_y = RewTerm(
+        func=mdp.feet_distance_y,
+        weight=0.1,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "min": 0.14,
+            "max": 0.50,
+        },
+    )
+
+    sound_suppression = RewTerm(
+        func=mdp.sound_suppression_acc_per_foot,
+        weight=0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=".*_ankle_roll_link",
+            ),
+        },
+    )
+
+    # v35: constant-yaw-bias guard. v34 sim2sim: body-frame tracking fine
+    # (vx 0.89/vy ~0) but a persistent +4.6 deg/s yaw bias on straight
+    # commands -> 55 deg heading drift / +3.5 m lateral over 12 s (v32b was
+    # 0.4 deg/s). EMA(alpha 0.005) of (ang_vel_z - cmd_z) isolates the DC;
+    # exp-kernel std 0.5 rad/s is blind at 0.08 rad/s (kernel 0.975).
+    yaw_bias = RewTerm(
+        func=mdp.yaw_rate_bias_guard,
+        weight=0,
+        params={"command_name": "base_velocity"},
+    )
+
+    # -- other
+    undesired_contacts = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-1,
+        params={
+            "threshold": 1,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["(?!.*ankle.*).*"]),
+        },
+    )
+
+
+@configclass
+class X1AmpEnvCfg(AmpEnvCfg):
+    rewards: X1AmpRewards = X1AmpRewards()
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # ------------------------------------------------------
+        # Scene
+        # ------------------------------------------------------
+        self.scene.robot = X1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+        # plane terrain
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
+
+        # ------------------------------------------------------
+        # motion data
+        # ------------------------------------------------------
+        # v31: x1_lab_v31 = fix_arm_decomposition.py (v30 arm fix) +
+        # fix_ground_root.py (sole penetration -> 0, L/R ankle stance-pitch
+        # symmetrization, root_z ground anchoring) + 2 new CMU overground
+        # walking clips (103_07, retargeted locally with the same
+        # auto-IK config; real stride-speed dynamics the in-place BMLrub
+        # demos lack). Dropped: 114_08/114_09/127_04/127_06.
+        # v32 (v38): disc sees the arms — 10-body key_body_pos (knees,
+        # ankles, elbows, shoulders, wrists) regenerated by
+        # extend_key_bodies_v32.py from v31 dof via MuJoCo FK (<=1.2 mm
+        # gate); mirrors regenerated after the mirror_lab_motions.py
+        # column-order fix (dof was written in gmr order since v28 —
+        # kb was correct, dof only fed the replay/visualization buffers).
+        # v62: X1_MOTION_DIR swaps the demo dataset (e.g. x1_lab_v32_200 =
+        # PCHIP-upsampled 200 fps demos — 10 ms fetch at 100 Hz lands on
+        # exact keys, no interpolation; upsample_demo_spline.py, 22/22
+        # roundtrip+FK validated).
+        self.motion_data.motion_dataset.motion_data_dir = os.path.join(
+            ROBOLAB_ROOT_DIR, "data", "motions",
+            os.environ.get("X1_MOTION_DIR", "x1_lab_v32")
+        )
+        # v67 (audit r2 directive 4 — the REAL demo-replacement route):
+        # overground-dominant library. Candidate 138_18 went through the
+        # FULL v31 fix chain (arm decomposition + ground root + mirror +
+        # 10-body extend) but still fails the A5 shoulder-antiphase /
+        # C2 coupling gates (+0.47 / -0.20 — the same reason v31 dropped
+        # it); EXCLUDED. The overground family is 36_01/36_11/0026
+        # (+mirrors) = 69% of weight mass; the in-place treadmill family
+        # stays at token weights to serve stand/near-zero commands under
+        # VMATCH; 103_07 (2x playback) excluded entirely.
+        _motion_dir = os.environ.get("X1_MOTION_DIR", "x1_lab_v32")
+        if _motion_dir == "x1_lab_v72":
+            # v72 low-cadence library (audit 2026-10-22 fix order):
+            # 40 CMU low-cadence normal-amplitude clips (07/08/35/38/82,
+            # 96-130 spm -> 0.80-1.09 Hz/foot, step 0.38-0.59 m at robot
+            # scale) + 7 stance-anchor-rebuilt legacy walk clips. Jogs and
+            # the 36_xx stepping-platform clips REMOVED. Weights bucketed
+            # by (robot speed, cadence) for 2D-balanced sampling:
+            #   PRIME 0.85-1.25 m/s @<=135 spm  w=1.2 (the 1.0 m/s target
+            #   neighborhood incl. 82_12/13 at 0.99 m/s / 0.94 Hz / 0.53 m)
+            #   MID   0.35-0.85 m/s @<=110 spm  w=0.7 (walk05-08 domain)
+            #   FAST  >1.25 m/s                  w=0.5
+            self.motion_data.motion_dataset.motion_data_weights = {
+                # PRIME band
+                "07_01": 1.2, "08_03": 1.2, "38_02": 1.2, "103_07": 1.2,
+                # MID band (35-family low cadence + legacy anchored walks)
+                "38_01": 0.7,
+                "35_01": 0.7, "35_02": 0.7, "35_03": 0.7, "35_04": 0.7,
+                "35_05": 0.7, "35_06": 0.7, "35_07": 0.7, "35_08": 0.7,
+                "35_09": 0.7, "35_10": 0.7, "35_11": 0.7, "35_12": 0.7,
+                "35_13": 0.7, "35_14": 0.7, "35_15": 0.7, "35_16": 0.7,
+                "35_28": 0.7, "35_30": 0.7, "35_31": 0.7, "35_32": 0.7,
+                "35_33": 0.7, "35_34": 0.7,
+                "0000_treadmill_norm": 0.7, "0002_treadmill_slow": 0.7,
+                "0005_normal_walk1": 0.7, "0007_normal_walk3": 0.7,
+                "0008_normal_walk4": 0.7,
+                # FAST band + turning
+                "08_01": 0.5, "08_06": 0.5, "08_08": 0.5,
+                "0026_circle_walk": 0.6,
+                # mirrors
+                "07_01_mirror": 1.2, "08_03_mirror": 1.2,
+                "38_02_mirror": 1.2,
+                "103_07_mirror": 1.2, "38_01_mirror": 0.7,
+                "35_01_mirror": 0.7, "35_02_mirror": 0.7, "35_03_mirror": 0.7,
+                "35_04_mirror": 0.7, "35_05_mirror": 0.7, "35_06_mirror": 0.7,
+                "35_07_mirror": 0.7, "35_08_mirror": 0.7, "35_09_mirror": 0.7,
+                "35_10_mirror": 0.7, "35_11_mirror": 0.7, "35_12_mirror": 0.7,
+                "35_13_mirror": 0.7, "35_14_mirror": 0.7, "35_15_mirror": 0.7,
+                "35_16_mirror": 0.7, "35_28_mirror": 0.7, "35_30_mirror": 0.7,
+                "35_31_mirror": 0.7, "35_32_mirror": 0.7, "35_33_mirror": 0.7,
+                "35_34_mirror": 0.7,
+                "0000_treadmill_norm_mirror": 0.7,
+                "0002_treadmill_slow_mirror": 0.7,
+                "0005_normal_walk1_mirror": 0.7,
+                "0007_normal_walk3_mirror": 0.7,
+                "0008_normal_walk4_mirror": 0.7,
+                "08_01_mirror": 0.5, "08_06_mirror": 0.5, "08_08_mirror": 0.5, "0026_circle_walk_mirror": 0.6,
+            }
+            # v88 (RECORD_BOOK 12.6, audit directive 2026-10-28): add the
+            # 82_12/13 long-step 1.0 m/s demos to PRIME. The v72-era claim
+            # "82 lumY 75-77>75 rejected" is now fixed (lumY damped to
+            # 73.4/73.5 deg, key_body_pos regenerated 10-body by FK,
+            # J-gate PASS 0-fail); the earlier "stance 52-61mm" measurement
+            # was an FK-projection artifact — authoritative key_body_pos
+            # heading-frame double-stance sep = 203-211mm (inside the
+            # feet_distance_y bonus band [0.2,0.3]). rootV 0.99-1.01 m/s,
+            # step ~0.53 m — the only in-library 1.0 m/s exemplars.
+            # Single-variable data switch; default OFF = byte-identical.
+            if os.environ.get("X1_V88_PRIME82", "0") == "1":
+                _w = self.motion_data.motion_dataset.motion_data_weights
+                for _n in ("82_12", "82_13", "82_12_mirror", "82_13_mirror"):
+                    _w[_n] = 1.2
+                print("[DATASET] v88: 82_12/13 (+mirrors) added to PRIME "
+                      "w=1.2 (1.0 m/s long-step exemplars; 40 sources)")
+            # v90 (RECORD_BOOK 12.9): fresh-chain CMU fast-family retargets.
+            # f08_01 (1.14 m/s) / f08_03 (1.10) sit INSIDE the cmd-1.0 VMATCH
+            # window [0.85,1.15] with the longest steps in the library
+            # (~0.55 m vs stream's 0.42-0.53) — genuine long-step exemplars
+            # at the target speed. f08_06/f08_08 (1.27) go to FAST as
+            # curriculum assets. Default OFF = byte-identical.
+            if os.environ.get("X1_V90_PRIMEF08", "0") == "1":
+                _w = self.motion_data.motion_dataset.motion_data_weights
+                for _n in ("f08_01", "f08_01_mirror", "f08_03", "f08_03_mirror"):
+                    _w[_n] = 1.2
+                for _n in ("f08_06", "f08_06_mirror", "f08_08", "f08_08_mirror"):
+                    _w[_n] = 0.5
+                print("[DATASET] v90: f08_01/f08_03 (+mirrors) added to "
+                      "PRIME w=1.2 (in-window long-step 1.10-1.14 m/s); "
+                      "f08_06/f08_08 at FAST 0.5")
+            print("[DATASET] v72 low-cadence library weights active "
+                  "(36 sources: 29 CMU + 7 anchored legacy; jogs/36xx/11 gate-rejected removed)")
+        elif _motion_dir == "x1_lab_v67":
+            self.motion_data.motion_dataset.motion_data_weights = {
+                "36_01": 4.0, "36_11": 3.0, "0026_circle_walk": 3.0,
+                "0000_treadmill_norm": 0.5, "0002_treadmill_slow": 0.5,
+                "0005_normal_walk1": 0.5, "0007_normal_walk3": 0.5,
+                "0008_normal_walk4": 0.5,
+                "0003_treadmill_jog": 1.0, "0009_normal_jog1": 1.0,
+                "36_01_mirror": 4.0, "36_11_mirror": 3.0,
+                "0026_circle_walk_mirror": 3.0,
+                "0000_treadmill_norm_mirror": 0.5,
+                "0002_treadmill_slow_mirror": 0.5,
+                "0005_normal_walk1_mirror": 0.5,
+                "0007_normal_walk3_mirror": 0.5,
+                "0008_normal_walk4_mirror": 0.5,
+                "0003_treadmill_jog_mirror": 1.0,
+                "0009_normal_jog1_mirror": 1.0,
+            }
+            print("[DATASET] v67 overground-dominant weights active "
+                  "(103_07 + 138_18 excluded)")
+        # Motion weights: must explicitly list motion names (empty dict = load nothing)
+        # v28: every clip now has a FK-verified left-right mirrored twin
+        # (roboparty_train/mirror_lab_motions.py, FK mirror error < 0.8 mm on
+        # all 14 clips). The AMASS refs themselves are heavily L/R asymmetric
+        # (hip swing ratio 0.35-0.97) and v27 inherited it (0.5 m/s policy
+        # ratio 0.832 < 0.85). A mirrored-pair dataset makes the AMP style
+        # prior exactly symmetric by construction.
+        # v30: DROP 114_08 / 114_09 / 127_04 / 127_06 (+ mirrors): non-walking
+        # arm styles (raised/folded arms, waist swing 86-98 deg that even the
+        # re-IK fallback tiers cannot compress - shoulder_roll saturates at
+        # its abduction limit on 34-43% of frames). They were the main
+        # asymmetric-forearm-pose style polluters in v29.
+        # v31 additions at weight 1.0: 103_07 (1.2 m/s) —
+        # real overground walking (genuinely counter-rotating torso, GMR
+        # lumY swing 62 deg; kept at c=1.0 = exact elbows, subordinate
+        # weight so the restrained BMLrub style stays dominant).
+        # v72 BUGFIX (audit metric: line-671 unconditional override): the
+        # v32 default table now applies ONLY to the v32/v67-default path —
+        # previously it silently overwrote every X1_MOTION_DIR branch above.
+        if _motion_dir == "x1_lab_v32":
+         self.motion_data.motion_dataset.motion_data_weights = {
+            "36_01": 3.0,  # v51: 197/165mm
+            "36_11": 1.0,
+            "0000_treadmill_norm": 2.0,
+            "0002_treadmill_slow": 2.0,
+            "0003_treadmill_jog": 5.0,  # v51: highest wrist swing 198/244mm
+            "0005_normal_walk1": 2.0,
+            "0007_normal_walk3": 2.0,
+            "0008_normal_walk4": 2.0,
+            "0009_normal_jog1": 5.0,  # v51: 121/168mm
+            "0026_circle_walk": 2.0,
+            "103_07": 1.0,
+            "36_01_mirror": 3.0,
+            "36_11_mirror": 1.0,
+            "0000_treadmill_norm_mirror": 2.0,
+            "0002_treadmill_slow_mirror": 2.0,
+            "0003_treadmill_jog_mirror": 5.0,
+            "0005_normal_walk1_mirror": 2.0,
+            "0007_normal_walk3_mirror": 2.0,
+            "0008_normal_walk4_mirror": 2.0,
+            "0009_normal_jog1_mirror": 5.0,
+            "0026_circle_walk_mirror": 2.0,
+            "103_07_mirror": 1.0,
+        }
+
+        # ------------------------------------------------------
+        # animation
+        # ------------------------------------------------------
+        self.animation.animation.num_steps_to_use = AMP_NUM_STEPS
+
+        # v65 (structural route 1, revised on pairing forensics): SPEED-
+        # MATCHED demo fetch. The disc minibatches pair policy/demo windows
+        # through INDEPENDENT permutations, so per-window phase alignment
+        # does not exist; the implementable data-side repair is demo
+        # COMPOSITION — at walking commands the disc sees only overground
+        # human-cadence segments (0026/36_01/36_11) instead of the
+        # in-place treadmill family (14/22 clips, world v~=0, horizontal
+        # kinematics resembling micro-stepping — the v61-forensics disc
+        # equilibrium preferring micro-gait at 2.7x style income). Also
+        # drops 103_07 (+mirror): 60Hz source stored at 120 = 2x playback,
+        # its 218 spm cadence literally demonstrates micro-gait rhythm.
+        import os as _os_vm
+        if _os_vm.environ.get("X1_DISC_VMATCH", "0") == "1":
+            self.animation.animation.speed_matched_fetch = True
+            # drop 103_07 (+mirror): 60Hz source stored at 120 = 2x
+            # playback (218 spm). REMOVE from the weights dict (a zero
+            # weight still requires the file to exist — first v67c launch
+            # died in the loader on exactly that).
+            _mw = self.motion_data.motion_dataset.motion_data_weights
+            for _drop in ("103_07", "103_07_mirror"):
+                _mw.pop(_drop, None)
+            print("[DISC-VMATCH] speed-matched demo fetch ON; 103_07(+mirror) "
+                  "removed from weights (2x playback = 218 spm)")
+
+        # ------------------------------------------------------
+        # Observations — discriminator
+        # ------------------------------------------------------
+        self.observations.disc.key_body_pos_b.params = {
+            "asset_cfg": SceneEntityCfg(
+                name="robot",
+                body_names=KEY_BODY_NAMES,
+                preserve_order=True,
+            )
+        }
+        # v49b: the same key bodies' VELOCITY feeds the disc (amplitude
+        # channel). Toggle via X1_DISC_VEL=0 to disable (defaults ON in v49b+
+        # envs; the obs-dim mismatch on resume is handled by the amp_runner
+        # disc re-init path).
+        import os as _os3
+        if _os3.environ.get("X1_DISC_VEL", "1") == "0":
+            self.observations.disc.key_body_vel_b = None
+            # demo side must shrink with the policy side, else amp.py
+            # resolve_amp_config asserts disc_demo_obs_dim == disc_obs_dim
+            # (TASK_20261111_031 crashed exactly here). v2d ablation fix.
+            self.observations.disc_demo.ref_key_body_vel_b = None
+        else:
+            self.observations.disc.key_body_vel_b.params = {
+                "asset_cfg": SceneEntityCfg(
+                    name="robot",
+                    body_names=KEY_BODY_NAMES,
+                    preserve_order=True,
+                )
+            }
+        self.observations.disc.history_length = AMP_NUM_STEPS
+
+        # ------------------------------------------------------
+        # v63: X1_DISC_LINVEL=1 — root LINEAR velocity joins the disc obs.
+        # The AMP paper's ablation (Sec. 9.3, Fig. 8) marks velocity
+        # features as REQUIRED for dynamic motion, and both canonical
+        # implementations (IsaacGymEnvs HumanoidAMP, escontro/AMP_for_
+        # hardware) include local root lin vel in Phi(s). This repo had it
+        # commented out; without it the disc window (60-600 ms of
+        # base-relative kinematics) cannot see displacement rate at ALL —
+        # micro-stepping (0.1 m/s) and walking (1.0+ m/s) are locally
+        # near-identical, which is the observation-space basis of the 100 Hz
+        # style collapse (v61f forensics: micro-gait style income 2.7x the
+        # champion's per second). Appended LAST so the obs prefix keeps the
+        # champion ordering; disc_obs_dim 121 -> 124 (disc re-inits on
+        # resume via the amp_runner shape path).
+        # ------------------------------------------------------
+        if __import__("os").environ.get("X1_DISC_LINVEL", "0") == "1":
+            from isaaclab.managers import ObservationTermCfg as ObsTermX
+            self.observations.disc.base_lin_vel = ObsTermX(func=mdp.base_lin_vel)
+            self.observations.disc_demo.ref_root_lin_vel_b = ObsTermX(
+                func=mdp.ref_root_lin_vel_b,
+                params={"animation": ANIMATION_TERM_NAME, "flatten_steps_dim": False},
+            )
+            print("[DISC-LINVEL] root linear velocity ADDED to disc obs "
+                  "(policy: base_lin_vel, demo: ref_root_lin_vel_b; "
+                  "dim 121 -> 124; disc re-inits on resume)")
+
+        # ------------------------------------------------------
+        # Rewards
+        # ------------------------------------------------------
+        # task
+        self.rewards.track_lin_vel_xy_exp.weight = 1.25
+        self.rewards.track_ang_vel_z_exp.weight = 1.25
+        self.rewards.alive.weight = 0.15
+
+        # base
+        self.rewards.ang_vel_xy_l2.weight = -0.1
+        self.rewards.flat_orientation_l2.weight = -1.2
+
+        # joint
+        self.rewards.joint_vel_l2.weight = -2e-4
+        self.rewards.joint_acc_l2.weight = -2.5e-7
+        self.rewards.action_rate_l2.weight = -0.01
+        # v40 arm-channel halves (see X1AmpRewards): legs/torso keep the
+        # original weights via the base terms above.
+        # v47: quartered (v40 halving lifted arms 18.7->25.5 deg)
+        # v49b measured the 22-25 deg plateau WITH the velocity disc channel
+        # live — the smoothing penalty is the remaining suppressor (v40/v47
+        # lever history: halving +36%). v50: EIGHTHED, paired with the disc
+        # velocity channel (X1_DISC_VEL=1) for the audit's >=35 deg target.
+        # Revert to quarters if arm jitter/degradation appears in P7.
+        self.rewards.joint_acc_l2_arms.weight = -6.25e-8   # v51: back to quarters (1/2 peak, 1/8 regressed)
+        self.rewards.action_rate_l2_arms.weight = -0.0025
+        # v40: hip swing-amplitude guard doubled (v39 -0.3 recovered only
+        # +0.024 ratio over 1500 iters; base is v35 whose ratio was 0.874)
+        # v44 @ -0.8: walk05 knee 0.838 (1.4% short), walk10 hip 0.955.
+        # v45 @ -1.2: walk05 knee 0.939 PASS, walk10 hip 0.843 (0.8%
+        # short) — complementary one-metric misses. v46 takes the
+        # midpoint to land both inside [0.85, 0.99].
+        self.rewards.leg_amp_asym.weight = -1.0
+        # v52 @0.3 OVERDOSE: arms 66-71 deg (2.7x plateau — the lever
+        # WORKS) but arm-DC asym 35-54 deg + phase anti lost + drift.
+        # v53 mid-dose: hold the amplitude in the [30,45] band with the
+        # form gates; arm_asym_lean doubled to contain the DC.
+        # v54: 0.08 landed the band edge (29-32) but P7g missed by 0.1 deg
+        # and walk05 phase/hip slid — step DOWN one notch (the v53 readout
+        # says the amplitude is already saturating the band's lower edge;
+        # slightly less prior should relax the DC/phase coupling while
+        # keeping arms >= 26-30) with the DC guard raised one notch.
+        # v56 (human-gait arc): resume the SOUP534_40 regime — v55's
+        # phase-locked term FAILED its accept (8/13, P3a/P3b kernel gates;
+        # TASK_20260916_082), so it is OFF and the flat prior returns to
+        # v54's 0.06 dose (the soup's nearer parent recipe; single-variable
+        # discipline: everything except knee_extension matches the base).
+        self.rewards.arm_amp_prior.weight = float(
+            __import__("os").environ.get("X1_ARM_PRIOR", "0.06"))
+        self.rewards.arm_amp_phase.weight = 0.0
+        # v61e: at 100 Hz the disc equilibrium saturates (rew≈1.0, style
+        # gradient dead — v61d2 forensics: prior credit fell to 1/3 of the
+        # 50 Hz champion's while style ROSE) and the optimizer slides to a
+        # low-amplitude micro-gait. X1_ARM_PRIOR replaces the disc's dead
+        # amplitude pressure with the calibrated dose-response lever
+        # (v52 0.3 -> 66-71 deg, v53 0.08 -> 29-32, champion 0.06 -> 34.7
+        # WITH a live disc; without one, 0.12 sits between v53 band-edge
+        # and v52 blowup).
+        # v56 single variable: STRAIGHT-KNEE stance prior (GOAL_HUMAN_GAIT
+        # §4.1). DOSE LADDER: 0.15 (v56, TASK_20260916_097) OVERSHOT — K1
+        # hit 10.5-12.9 deg (huge margin vs the 18 gate) but PAID: walk05/
+        # back05 swing height collapsed (off-run 6-7 frames vs soup 13-15;
+        # peak 16-22 mm; near-drag backwalk), walk10 knee symmetry 0.836
+        # (<0.85), fine-metric toe-first ~100%. Step DOWN to 0.10 (v56b)
+        # expecting K1 ~15-20 with the swing/symmetry costs reduced
+        # (v52-54 dose-response methodology: never publish a one-point dose).
+        self.rewards.knee_extension.weight = 0.10
+        # v57 (heel-toe round, GOAL §4.2/§4.3 — one coupled variable):
+        # heel-strike prior at w=0.15 + the phased sole-flat rework in
+        # rewards.stance_sole_flat_walk (heel-strike/push-off phases
+        # exempt, foot-flat penalty kept). Baseline H1 0%, H3 65-100%.
+        # v57c: 0.15 -> 0.40 (event-sparse: ~0.037 events/step; the per-event
+        # advantage 0.4x0.28 = 0.11 must be perceivable against ~16/step)
+        self.rewards.heel_first.weight = 0.40
+        # v57d: ankle-flick penalty (excess ~1.0-1.2 rad/s on policies,
+        # ~0 on refs -> -0.2..-0.24/step during terminal swing frames).
+        # F1 v1i lesson (2026-10-11): SWING_CLEAR=-0.5 satisfied clearance
+        # via PLANTARFLEXION (toe-reach) instead of knee flexion — toe-first
+        # landing exploded to 74-100%. X1_ANKLE_FLICK doubles the penalty
+        # (-0.4) to close the plantarflexion cheat path while SWING_CLEAR
+        # keeps pushing swing height.
+        self.rewards.ankle_flick.weight = -float(
+            __import__("os").environ.get("X1_ANKLE_FLICK", "0.2"))
+        # v57e: dense readiness prior at 0.3 (low-swing frames ~15% of
+        # steps; ref-like posture sustains ~0.7 -> ~0.03/step; the flick
+        # posture scores 0.21 -> the delta ~-0.015/step every low frame)
+        self.rewards.heel_down_ready.weight = 0.3
+        # v60: swing clearance floor w=-0.5 (drag foot pays ~-0.25/step
+        # during drag frames; healthy swing/stance pay 0; refs pay 0)
+        import os as _os_v60
+        if _os_v60.environ.get("X1_SWING_CLEAR", "0") == "1":
+            self.rewards.swing_clearance.weight = -0.5
+        # v63: RHYTHM prior dose (GOAL_RHYTHM.md §3). Single-variable
+        # discipline: v63 = v59c recipe frozen + this term only. Dose
+        # ladder planned 0.3/0.6/1.0 (v52-54 methodology); start 0.6
+        # (event-sparse terms need perceivable per-event advantage vs the
+        # ~16/step stream — v57c heel_first 0.15->0.40 precedent).
+        self.rewards.gait_period.weight = float(
+            __import__("os").environ.get("X1_CADENCE_PRIOR", "0"))
+        # v64b: dense swing-duration prior dose (default 0 = off). Paired
+        # with the cadence prior as ONE rhythm-lever family (v57 heel_first
+        # + sole_flat rework precedent for coupled terms).
+        self.rewards.swing_airtime.weight = float(
+            __import__("os").environ.get("X1_SWING_PRIOR", "0"))
+        # v64c: phase-locked hip reference dose (default 0 = off). The
+        # rhythm-family v2: kinematic anchor + the two scalar guards.
+        self.rewards.hip_phase.weight = float(
+            __import__("os").environ.get("X1_HIP_PHASE", "0"))
+        self.rewards.joint_pos_limits.weight = -1.0
+        self.rewards.joint_energy.weight = -1e-4
+        self.rewards.joint_torques_l2.weight = -1e-5
+        # v32: difference stat (v28b, wrong premise -> caused sync arms)
+        # v34: now the high-passed residual statistic. Zero on natural
+        # antiphase at any amplitude AND on the reference's shared DC
+        # (measured ref score ~-0.015/step vs -0.137 for the deprecated
+        # sum); in-phase swing (the v31d defect) still caught.
+        self.rewards.arm_pitch_sync.weight = -0.3
+        # v33/v34 (v32b defects, diag_arm_offset.py):
+        # - frozen antisymmetric arm offset: L -9 / R +9.8 deg held -> slow
+        #   EMA (tau 8 s) DC guard; ref ~5 deg (-0.019) vs frozen 18.8 deg
+        #   (-0.066) -> separates natural small asym from frozen defects
+        # v42: doubled — v40 ran with -0.2 and still grew a 33 deg arm-DC
+        # asymmetry (P7g fail) that coupled into -3.06 m drift
+        # v53: doubled again — v52@0.3 prior grew 35-54 deg DC asym; the
+        # amplitude lever needs the DC guard at strength
+        # v54: -0.8 -> -1.2 (v53's residual P7g 12.1 vs 12 is pure DC)
+        # v63c: env lever X1_ARM_ASYM (default -1.2 unchanged) — the 100 Hz
+        #   fine-tune regrows the arm DC to P7g 12.8-13.7 deg (R arm frozen
+        #   ~11-14 deg back); -2.4 (v53-strength) targets the 0.8-1.7 deg
+        #   residual on a SHORT (+600) continuation from m10500.
+        self.rewards.arm_asym_lean.weight = float(
+            __import__("os").environ.get("X1_ARM_ASYM", "-1.2"))
+        # - arm/opposite-leg coupling: refs +0.8..+0.99 vs policy -0.12;
+        #   high-passed capped product (positive on ref, mean-shift free)
+        self.rewards.arm_leg_coupling.weight = 0.3
+        # - chest posture: refs mean +14.9 deg forward vs policy -9 deg back;
+        #   0.42 rad error -> -0.17/step at weight -0.4
+        self.rewards.lumbar_posture.weight = -0.4
+        # - v39: hip swing-amplitude symmetry (v38 regression 0.694/0.755).
+        #   v40: weight set near the joint section (-0.8, doubled; v39's
+        #   -0.3 recovered only +0.024 ratio over 1500 iters)
+        # ------------------------------------------------------
+        # ATTRIBUTION ablation (user goal structure: velocity tracking ->
+        # task reward; ALL other gait form -> style discriminator).
+        # X1_FORM_GUARDS=0 zeroes the five hand-engineered form guards
+        # (arm_pitch_sync / arm_asym_lean / arm_leg_coupling /
+        # lumbar_posture / leg_amp_asym), leaving: task velocity rewards +
+        # physics regularization + the AMP style channel. If gait form
+        # (P7/G2/arm swing) HOLDS in a short fine-tune under this config,
+        # the discriminator is the form controller (goal achieved); if it
+        # regresses, the guards are still carrying the form (style not yet
+        # dominant). stance_sole_flat/feet_slide/yaw_bias stay ON (physical
+        # landing-quality/safety regularization, not style shaping).
+        # ------------------------------------------------------
+        import os as _os2
+        _fg = _os2.environ.get("X1_FORM_GUARDS", "1")
+        # ATTRIBUTION RESULT (TASK_20260914_070): with all 5 guards off,
+        # leg symmetry IMPROVED (walk10 hip 0.718->0.941, walk05
+        # 0.698->0.900) and arm phase held (anti -0.96 / coupling +0.50)
+        # — the discriminator (mirrored dataset + 10-body obs) carries
+        # legs + arm PHASE. Only arm DC lean (P7h 14.2>12, walk05 asym
+        # 32.5 deg) and torso pitch (+17.3 vs 14.9) regressed — those are
+        # guard-carried. Mode 2 = minimal-guard disc-led config.
+        if _fg == "2":
+            self.rewards.arm_pitch_sync.weight = 0.0
+            self.rewards.arm_leg_coupling.weight = 0.0
+            self.rewards.leg_amp_asym.weight = 0.0
+            print("[FORM-GUARDS] X1_FORM_GUARDS=2 — minimal guards: "
+                  "arm_asym_lean + lumbar_posture kept (arm DC/torso are "
+                  "still guard-carried); pitch_sync/coupling/leg_amp_asym "
+                  "retired (discriminator-led per attribution probe)")
+        elif _fg == "0":
+            self.rewards.arm_pitch_sync.weight = 0.0
+            self.rewards.arm_asym_lean.weight = 0.0
+            self.rewards.arm_leg_coupling.weight = 0.0
+            self.rewards.lumbar_posture.weight = 0.0
+            self.rewards.leg_amp_asym.weight = 0.0
+            print("[FORM-GUARDS] X1_FORM_GUARDS=0 — form attribution ablation: "
+                  "5 hand-engineered guards OFF; form must come from the "
+                  "discriminator or degrade")
+
+        # feet
+        self.rewards.feet_slide.weight = -0.1
+        self.rewards.sound_suppression.weight = -5e-5
+        self.rewards.feet_distance_y.weight = 0.05
+
+        # v27 gait quality: v26 sim2sim evidence (gait_metrics on model_3999,
+        # acceptance/v27_eval/v26_gait_report.json):
+        #   - 1.0 m/s: heel raised 19% of mid-stance (ball-foot), sole pitch
+        #     to -42 deg in stance -> stance_sole_flat kills it. Reference
+        #     clips keep the sole flat (heelup=0.000), so this is aligned
+        #     with the AMP style, not fighting it.
+        # Magnitude at v26 gait: mean sin^2 tilt = 0.157 (1.0 m/s) -> weight
+        # -1.5 gives ~-0.24/step: ~9% of task reward (2.65/step at perfect
+        # tracking), dominant among always-on penalties but reducible to ~0
+        # by flat soles (reference proves feasible).
+        # NOTE: NO instantaneous hip-pair symmetry term: measured on v26 data,
+        # corr(dev_L,dev_R)=+0.78 — gait mirror symmetry is invariance under
+        # mirror x T/2 shift, so neither |mean| nor |diff| of instantaneous
+        # deviations isolates amplitude asymmetry (both punish normal swing).
+        # If v27 hip amplitude ratio still < 0.85, v28 needs a per-cycle
+        # amplitude-energy term (stateful). 127_06 down-weight may improve it
+        # incidentally (its toe-down style plausibly drove the asymmetry).
+        self.rewards.stance_sole_flat.weight = -1.5
+
+        # v35: yaw DC bias guard. Calibrated (offline, alpha 0.005):
+        # v33b/v34 carry a 4.7-5.2 deg/s DC bias on zero-yaw commands
+        # (-> 55 deg heading drift / 3.5 m lateral in 12 s sim2sim), v32b
+        # only 0.4. At weight -0.5: v34-level bias (0.09 rad) -> -0.046/step
+        # (comparable to feet_slide, enough to matter); good tracking (EMA
+        # ~0.05 rad transient) -> -0.003; refs' slow-turn segments (e.g.
+        # 103_07 local 30 deg/s) would score -0.26 — deliberate: turning
+        # belongs to yaw COMMANDS, not to zero-yaw drift.
+        # v35 set -0.5 (fixed the v34 +4.7 deg/s bias); v47's clean phase
+        # regrew +1.81/+2.32 m drift (audit item 1) — double the pressure
+        # for regime-recovering fine-tunes.
+        # v57 defensive escalation (NOT an experimental variable; v47
+        # precedent — the same play, -0.5 -> -1.0, fixed v47's +4.7 deg/s
+        # clean-phase bias): v56b@0.10's LAST ~400 iters grew a +5.4 deg/s
+        # signed yaw bias (+4.68 m drift; m9000 was clean). Double the
+        # guard for this regime-recovering fine-tune.
+        # v59 (audit round 1): env-selectable yaw guard — X1_YAW_GUARD
+        # (default -2.0 = the v57+ dose with v57e evidence of holding drift
+        # net; "-1.0" restores the v56 recipe for A/B isolation).
+        import os as _os_y
+        self.rewards.yaw_bias.weight = -float(_os_y.environ.get("X1_YAW_GUARD", "2.0"))
+
+        # ------------------------------------------------------
+        # v69 gait-posture guards (user defect spec 2026-10-15):
+        #   X1_TOE_GUARD  — foot heading |hdg| beyond 6 deg (geometric;
+        #                   m11498: L+20/R-11 deg held DC)
+        #   X1_ABD_GUARD  — whole-leg hip_roll outward DC beyond 4 deg
+        #                   (m11498: +13.1/+12.3 deg, stance 460mm vs
+        #                   demo 220-260mm — user: 整条腿往外展)
+        #   X1_SWAY_GUARD — lumbar roll/yaw + hip_roll AC pump (m11498:
+        #                   lr 27deg ptp, ly 52deg, base sway 619mm,
+        #                   waist->shoulder corr +0.96 waist leading)
+        #   X1_STANCE_MAX — feet_distance_y band max (0.5 -> 0.38 m)
+        # Defaults 0 / unchanged = every earlier recipe byte-identical.
+        # These are posture/physical regularization (like yaw_bias /
+        # stance_sole_flat), NOT form guards: X1_FORM_GUARDS does not
+        # touch them.
+        # ------------------------------------------------------
+        import os as _os_v69
+        self.rewards.foot_yaw_neutral.weight = -float(
+            _os_v69.environ.get("X1_TOE_GUARD", "0"))
+        self.rewards.hip_roll_abduction.weight = -float(
+            _os_v69.environ.get("X1_ABD_GUARD", "0"))
+        self.rewards.lateral_sway.weight = -float(
+            _os_v69.environ.get("X1_SWAY_GUARD", "0"))
+        # ------------------------------------------------------
+        # v70 forearm inward-fold guard (user defect spec rev2):
+        #   X1_SY_GUARD — |shoulder_yaw| beyond 15 deg, both arms
+        #                 (soup69_drift: R -64.6 deg DC -> forearm folds
+        #                 inward, -61 mm torso penetration; demos ~0)
+        # Default 0 = every earlier recipe byte-identical.
+        # ------------------------------------------------------
+        self.rewards.shoulder_yaw_fold.weight = -float(
+            _os_v69.environ.get("X1_SY_GUARD", "0"))
+        # ------------------------------------------------------
+        # v70b shared arm-lean guard (P7h regression): v70's sy band
+        # pushed the policy to re-solve arm redundancy via shoulder
+        # adduction -> shared forward lean 19-20 deg (gate 12).
+        #   X1_LEAN_GUARD — |mean(phiL,phiR)| beyond 6 deg (the exact
+        #                   P7h statistic, FK on body positions)
+        # Default 0 = every earlier recipe byte-identical.
+        # ------------------------------------------------------
+        self.rewards.arm_shared_lean.weight = -float(
+            _os_v69.environ.get("X1_LEAN_GUARD", "0"))
+        _stance_max = float(_os_v69.environ.get("X1_STANCE_MAX", "0"))
+        if _stance_max > 0:
+            self.rewards.feet_distance_y.params["max"] = _stance_max
+        # ------------------------------------------------------
+        # v71: EXOGENOUS GAIT CLOCK package (single-mechanism arc;
+        # acceptance/X1_GAIT_SPEC_V71.md). The 18-round falsification
+        # chain (v64-v70) exhausted reward-side anchoring of EMERGENT
+        # cadence; this package makes the rhythm exogenous — the policy
+        # OBSERVES the clock phase (obs terms below) and the task scores
+        # foot height/contact against it. Default OFF = byte-identical.
+        #   X1_GAIT_CLOCK=1     enable (rewards + policy/critic obs)
+        #   X1_FOOT_CLOCK_W     foot_clock weight  (default 1.0)
+        #   X1_CONTACT_CLOCK_W  contact_clock weight (default -0.5; pass
+        #                        the MAGNITUDE, sign applied here)
+        # ------------------------------------------------------
+        import os as _os_v71
+        if _os_v71.environ.get("X1_GAIT_CLOCK", "0") == "1":
+            self.rewards.foot_clock.weight = float(
+                _os_v71.environ.get("X1_FOOT_CLOCK_W", "1.0"))
+            self.rewards.contact_clock.weight = -float(
+                _os_v71.environ.get("X1_CONTACT_CLOCK_W", "0.5"))
+            from isaaclab.managers import ObservationTermCfg as ObsTermV71
+            _clock_obs_params = {"command_name": "base_velocity"}
+            self.observations.policy.gait_clock = ObsTermV71(
+                func=mdp.gait_clock_obs, params=_clock_obs_params)
+            self.observations.critic.gait_clock = ObsTermV71(
+                func=mdp.gait_clock_obs, params=_clock_obs_params)
+            print("[GAIT-CLOCK] v71 exogenous gait clock ON: foot_clock "
+                  f"w={self.rewards.foot_clock.weight}, contact_clock "
+                  f"w={self.rewards.contact_clock.weight}, "
+                  "policy+critic obs +[sinL,sinR,cosL,cosR] (96->100/frame)")
+        # v35 note: task_style_lerp 0.6->0.7 lives in the AGENT cfg
+        # (x1_amp_agent_cfg.py): P3a lin kernel sat at 0.78 since v31d
+        # (v27/v28: 0.84, old dataset); style reward now 1.14-2.00 (deep in
+        # saturation, marginal style gradient small). v21 history: lerp 0.75
+        # halved style 0.335->0.146 (P5a FAIL); 0.7 keeps ~10x P5a margin
+        # while shifting task/style 60/40 -> 70/30.
+        self.rewards.undesired_contacts.weight = -10.0
+        self.rewards.undesired_contacts.params["sensor_cfg"] = SceneEntityCfg(
+            "contact_forces",
+            body_names=["(?!.*ankle.*).*"],
+        )
+
+        # ------------------------------------------------------
+        # Commands
+        # ------------------------------------------------------
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.5, 2.5)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.5, 1.5)
+
+        # ------------------------------------------------------
+        # Events — override all RPO torso_link references to X1 body names
+        # (AmpEnvCfg base hardcodes RPO body names in multiple EventTerms)
+        # ------------------------------------------------------
+        self.events.add_base_mass.params["asset_cfg"].body_names = ["lumbar_pitch_link"]
+        self.events.randomize_rigid_body_com.params["asset_cfg"].body_names = ["lumbar_pitch_link", "base_link"]
+        if hasattr(self.events, "base_external_force_torque"):
+            self.events.base_external_force_torque.params["asset_cfg"].body_names = ["lumbar_pitch_link"]
+
+        # ------------------------------------------------------
+        # v29 sim2real hardening (toggle: X1_ROBUST_TRAIN=0 disables — used
+        # by the v29e clean-phase fine-tune to re-converge style/kernels
+        # onto a policy that already internalized recovery).
+        # v29b postmortem (TASK_20260909_165, 5/13):
+        # push +-1.2 m/s @2-5s made transient tilts trip the bad_orientation
+        # termination constantly -> 94% of episodes ended by orientation
+        # before recovery was learnable -> converged to "lean, never fall,
+        # never walk" (ep_len 278 vs v28d 996, mean reward -0.44 vs +22.98).
+        # v29c: moderate step from v28d's proven config:
+        #   push_robot +-0.8 m/s every 4-8 s (was +-0.5 @5-10 s)
+        #   action delay 0-1 step @ p=[.8,.2] (20 ms jitter; sweep showed
+        #   v28d already tolerates 1-step fully, 5/5)
+        # ------------------------------------------------------
+        import os as _os
+        _robust = _os.environ.get("X1_ROBUST_TRAIN", "1")
+        if _robust == "0":
+            pass  # clean regime (v29e clean-phase fine-tune)
+        else:
+            # v37 joint-schedule mode (X1_ROBUST_TRAIN=2): the two gate
+            # families are anti-correlated under sequential phases (v35:
+            # form 8/8 + robustness 55/60 but platform P3 kernels capped
+            # at 0.79 under full randomization; v36 clean ft: P3 12/13 but
+            # walk05 knee symmetry eroded 0.935 -> 0.678 and walk10 drift
+            # +0.29 -> +1.83 m within +600 iters). Half-strength
+            # perturbations keep the form/robustness pressure alive while
+            # the kernel gradient can still climb. push +-0.4 @ 6-12 s,
+            # delay 1 step kept (v29c measured v28d tolerates it fully).
+            if _robust == "2":
+                self.events.push_robot.interval_range_s = (6.0, 12.0)
+                self.events.push_robot.params["velocity_range"] = {
+                    "x": (-0.4, 0.4), "y": (-0.4, 0.4), "yaw": (-0.5, 0.5)}
+            elif _robust == "48":
+                # v48 joint convergence regime: soup-era steady state + a
+                # dedicated push1.0 exposure block. push1.0 fell to 0-1/5 in
+                # EVERY regime since v38 (v42's +-0.65 recovered 2/5 at a
+                # -0.026 kernel cost); the audit demands a real push phase.
+                # Frequency kept high (2-6 s) so 1.0-magnitude pushes are
+                # actually SEEN within short episodes.
+                self.events.push_robot.interval_range_s = (2.0, 6.0)
+                self.events.push_robot.params["velocity_range"] = {
+                    "x": (-0.65, 0.65), "y": (-0.65, 0.65), "yaw": (-0.8, 0.8)}
+            elif _robust == "4":
+                # v42: strong-mid. ROBUST=3 (±0.5 @5-10s) gave push1.0
+                # 0-1/5 across v39-v41; v35 full-strength (±0.8 @4-8s) gave
+                # 3/5. Interpolate both magnitude and frequency.
+                self.events.push_robot.interval_range_s = (4.0, 8.0)
+                self.events.push_robot.params["velocity_range"] = {
+                    "x": (-0.65, 0.65), "y": (-0.65, 0.65), "yaw": (-0.8, 0.8)}
+            elif _robust == "3":
+                # v38 intermediate: v37 (0.4) recovered walk05 form but
+                # push1.0 fell to 0/5 (v35 full-strength: 3/5). Interpolate.
+                self.events.push_robot.interval_range_s = (5.0, 10.0)
+                self.events.push_robot.params["velocity_range"] = {
+                    "x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-0.6, 0.6)}
+            else:
+                self.events.push_robot.interval_range_s = (4.0, 8.0)
+                self.events.push_robot.params["velocity_range"] = {
+                    "x": (-0.8, 0.8), "y": (-0.8, 0.8), "yaw": (-1.0, 1.0)}
+            self.action_delay_steps = 1
+            # v58 STRUCTURAL actuation-robustness envelope (course-correction
+            # step 3): the sim2sim terminal ankle flick is INVARIANT to
+            # deploy-side actuator model, PD recompute rate and ankle
+            # damping (4-probe matrix, V57_REPORT §2) — the residual channel
+            # is training-side envelope widening: gains (0.8,1.2)->(0.7,1.3),
+            # armature ditto, action delay cap 1->2 (per-env random 0/1/2,
+            # p-biased 0.8). Single platform round; accept = sim2sim H1>=60%
+            # with all non-regress gates.
+            if _os.environ.get("X1_ACT_RAND", "") == "2":
+                self.events.scale_actuator_gains.params[
+                    "stiffness_distribution_params"] = (0.7, 1.3)
+                self.events.scale_actuator_gains.params[
+                    "damping_distribution_params"] = (0.7, 1.3)
+                self.events.scale_joint_parameters.params[
+                    "armature_distribution_params"] = (0.7, 1.3)
+                self.action_delay_steps = 2
+                print("[ACT-RAND] v58 structural envelope: gains/armature "
+                      "0.7-1.3, action delay cap 2 (randomized)")
+            # ------------------------------------------------------
+            # v70d delay co-training knobs (single-variable, default off):
+            # m17000c2 (v70c2 LPF mid-point) FAILED robustness 36/60 with
+            # lat2 0/5 + lag2 0/5 — the LPF consumes the correction
+            # bandwidth the delay variants need. These knobs randomize the
+            # EXACT sweep axes during training so the policy re-learns
+            # balance under filter+delay stacking:
+            #   X1_ACT_DELAY — action delay cap (per-env random 0..N, the
+            #                  _random_action_delay ring; sweep --action-lag)
+            #   X1_OBS_DELAY — observation delay cap (per-env random 0..N,
+            #                  the _obs_delay ring; sweep --latency-steps)
+            # No gain widening (the sweep's gain/mass variants pass 5/5;
+            # lat2/lag2 are the failing axes).
+            # ------------------------------------------------------
+            _act_d = int(_os.environ.get("X1_ACT_DELAY", "0"))
+            if _act_d > 0:
+                self.action_delay_steps = _act_d
+                print(f"[v70d] action delay cap {self.action_delay_steps}")
+            _obs_d = int(_os.environ.get("X1_OBS_DELAY", "0"))
+            if _obs_d > 0:
+                self.obs_delay_steps = _obs_d
+                print(f"[v70d] obs delay cap {self.obs_delay_steps}")
+            # ------------------------------------------------------
+            # v70e DEMO-STATE phase-locked episode init (rhythm route 2,
+            # audit round-1 directive; 16 falsifications of reward/filter/
+            # data-resampling routes precede it). X1_DEMO_RESET_P > 0
+            # appends a mode="reset" event AFTER the default reset terms:
+            # walking-command envs start ON a retargeted demo frame (same
+            # motion_id + fetch_time the disc compares against — phase
+            # locked by construction). Changes the on-policy state
+            # distribution, not the reward.
+            # ------------------------------------------------------
+            _p_demo = float(_os.environ.get("X1_DEMO_RESET_P", "0"))
+            if _p_demo > 0:
+                from isaaclab.managers import EventTermCfg as _EventTermCfg
+                self.events.reset_from_demo = _EventTermCfg(
+                    func=mdp.reset_robot_from_demo,
+                    mode="reset",
+                    params={
+                        "p_demo": _p_demo,
+                        "min_cmd_speed": 0.3,
+                        "command_name": "base_velocity",
+                    },
+                )
+                print(f"[v70e] demo-state reset ON (p={_p_demo})")
+            # ------------------------------------------------------
+            # v70f frame-synced demo joint tracking (rhythm route 3, the
+            # persistent full-episode anchor the 17-round arc verdict
+            # demands; pairs with X1_DEMO_RESET_P=1.0 + X1_DISC_VMATCH=1).
+            #   X1_TRACK_HIP — exp kernel on |q - demo_q(t)| summed over
+            #                  [L,R] hip_pitch + [L,R] knee_pitch at
+            #                  t0 + episode_length_buf*dt (loop-wrapped).
+            # Default 0 = off = byte-identical recipes.
+            # ------------------------------------------------------
+            _track_w = float(_os.environ.get("X1_TRACK_HIP", "0"))
+            if _track_w > 0:
+                # v2p (phase C): X1_TRACK_FULL=1 extends the demo joint
+                # tracking to ALL 29 joints — the v2n4 post-mortem (9th
+                # disc collapse) showed the surviving separators are the
+                # ARM pose channels (frozen elbow +0.349, shoulder_pitch
+                # +0.27) which hip+knee-only tracking never drives to the
+                # demo pose; with the style gradient dead the arms stay at
+                # default forever. Full-body tracking closes them with the
+                # WORKING reward mechanism (ep_len 432 proved it).
+                if _os.environ.get("X1_TRACK_FULL", "0") == "1":
+                    import importlib.util as _ilu2
+                    from pathlib import Path as _P2
+                    _spec2 = _ilu2.spec_from_file_location(
+                        "amp_dof_order2",
+                        _P2(__file__).resolve().parent / "amp_dof_order.py")
+                    _m2 = _ilu2.module_from_spec(_spec2); _spec2.loader.exec_module(_m2)
+                    from isaaclab.managers import SceneEntityCfg as _SECFG
+                    # explicit full list: the reward maps demo columns by NAME
+                    # (motion_cols_for(list(joint_names))) — None would crash.
+                    self.rewards.demo_joint_track.params["asset_cfg"] = _SECFG(
+                        "robot", joint_names=list(_m2.LAB_DOF_NAMES),
+                        preserve_order=True)
+                    print("[v2p] demo joint tracking EXTENDED to ALL 29 joints")
+                self.rewards.demo_joint_track.weight = _track_w
+                print(f"[v70f] demo joint tracking ON (w={_track_w})")
+
+            # ------------------------------------------------------
+            # beyondmimic route (F1W_RUN_REPORT sec 10 route 1): deviation
+            # termination — tracking IS the task. X1_TRACK_TERM=1 appends a
+            # termination term (bad_demo_tracking, mean |q-demo_q| over leg
+            # joints > threshold). Default 0 = off = byte-identical.
+            # ------------------------------------------------------
+            if _os.environ.get("X1_TRACK_TERM", "0") == "1":
+                from isaaclab.managers import TerminationTermCfg as _DoneTermCfg
+                self.terminations.bad_demo_tracking = _DoneTermCfg(
+                    func=mdp.bad_demo_tracking,
+                    params={
+                        "threshold_rad": float(_os.environ.get("X1_TRACK_TERM_RAD", "0.6")),
+                        "command_name": "base_velocity",
+                        "min_cmd_speed": 0.3,
+                    },
+                )
+                print(f"[BEYONDMIMIC] demo-tracking deviation termination ON "
+                      f"(rad={_os.environ.get('X1_TRACK_TERM_RAD', '0.6')})")
+
+        # ------------------------------------------------------
+        # v68 sim2real re-identification envelope (x1_armature_pd.md §2,
+        # 2026-10-14). The nominal armature/kd in assets/robots/x1.py are now
+        # the IDENTIFIED values (kd=8.0 on lumbar/hip_pitch/hip_roll/knee is
+        # the R86/R52 firmware ceiling). Consequences, applied AFTER the
+        # X1_ACT_RAND block so no path re-widens them:
+        #   - armature randomization upper edge (0.8,1.2) -> (0.8,1.3)
+        #     (the x1_armature_pd.md §2 widening; multiplies the NEW nominal)
+        #   - damping randomization TIGHTENS to (0.8,1.0): 1.2 x 8 = 9.6
+        #     exceeds the firmware kd range — training against unreachable
+        #     gains. stiffness keeps (0.8,1.2) (kp is firmware-reachable).
+        # ------------------------------------------------------
+        self.events.scale_joint_parameters.params[
+            "armature_distribution_params"] = (0.8, 1.3)
+        self.events.scale_actuator_gains.params[
+            "damping_distribution_params"] = (0.8, 1.0)
+        print("[V68-SIM2REAL] armature rand (0.8,1.3), damping rand (0.8,1.0), "
+              "kp/kd/armature per x1_armature_pd.md")
+
+        # ------------------------------------------------------
+        # v61 X1_CONTROL_HZ time-constant compensation. decimation was
+        # already switched in AmpEnvCfg.__post_init__ (200//hz). The shared
+        # implementation lives in control_hz_renorm.py (isaaclab-free) so
+        # the local dry-run exercises the REAL walk, not a replica:
+        #   EMA alphas /r (explicit params AND func kwarg defaults),
+        #   action_delay_steps *r, action-rate weights *r, disc-vel EMA /r.
+        # (style_reward_scale x r is in x1_amp_agent_cfg.py.)
+        # ------------------------------------------------------
+        from .control_hz_renorm import apply_control_hz_renormalization
+        self.action_delay_steps = apply_control_hz_renormalization(
+            self.rewards, self.observations.disc, self.action_delay_steps)
+
+        # ------------------------------------------------------
+        # v63: X1_ACT_LPF_HZ — action low-pass cutoff (Hz), 0 = off (default
+        # keeps every earlier recipe byte-identical). Applied to the raw
+        # policy action BEFORE the delay ring in AmpEnv.step; the mirrored
+        # deploy-side filter is mujoco_rollout.py --action-lpf (same alpha
+        # math, same cascade order — see _action_lpf docstring). Restores
+        # the policy/demo frequency-hierarchy alignment at 100 Hz: the PD
+        # servo keeps its 100 Hz correction bandwidth while the policy's
+        # effective ACTION content is capped at the demo band (~10 Hz).
+        # ------------------------------------------------------
+        self.act_lpf_hz = float(os.environ.get("X1_ACT_LPF_HZ", "0"))
+        self.act_lpf_order = int(os.environ.get("X1_ACT_LPF_ORDER", "2"))
+        if self.act_lpf_hz > 0:
+            print(f"[ACT-LPF] action low-pass {self.act_lpf_hz:g} Hz "
+                  f"order {self.act_lpf_order} (dt={1.0/float(os.environ.get('X1_CONTROL_HZ', '50')):.4f}s)")
+
+        # ------------------------------------------------------
+        # Terminations — X1 body names
+        # X1 body structure: base_link → lumbar(yaw/roll/pitch) → arms
+        #                     base_link → hip(pitch/roll/yaw) → knee → ankle
+        # Terminate if any body except feet (ankle_*) touches ground
+        # ------------------------------------------------------
+        self.terminations.base_contact.params["sensor_cfg"].body_names = [
+            ".*_hip_.*_link",          # 髋关节着地
+            ".*_knee_.*_link",         # 膝盖着地
+            "base_link",               # 骨盆着地
+            "lumbar_.*_link",          # 腰部着地
+            ".*_shoulder_.*_link",     # 肩膀着地
+            ".*_elbow_.*_link",        # 手肘着地
+            ".*_wrist_.*_link",        # 手腕着地
+        ]
+
+        # ------------------------------------------------------
+        # v73: X1_INITIAL_REWARD=1 — reset the reward table to the
+        # INITIAL X1 AMP design (commit 6ea0655, 2026-08-06; archaeology
+        # 2026-10-24, RECORD_BOOK §8) before any term is dropped. This is
+        # the user directive of 2026-10-24: re-derive the reward from the
+        # original design instead of stacking on v27-v72 additions, keeping
+        # the reward stack the SINGLE experimental variable vs the v72
+        # recipe (infra kept: v68 dynamics, 600 ms disc window + linvel,
+        # VMATCH, ROBUST regime, 50 Hz).
+        #
+        # Initial 15+1-term table (weight-for-weight with 6ea0655):
+        #   task: lin/ang vel tracking 1.25 x2, alive 0.15
+        #   base: ang_vel_xy -0.1, flat_orientation -1.2
+        #   joint (WHOLE robot, no legs/arms split): joint_vel -2e-4,
+        #         joint_acc -2.5e-7, action_rate -0.01 (func reverted to
+        #         mdp.action_rate_l2), pos_limits -1.0, energy -1e-4,
+        #         torques -1e-5
+        #   feet: feet_slide -0.1, sound -5e-5, feet_distance_y 0.05
+        #         (max restored 0.50 — no X1_STANCE_MAX tightening)
+        #   safety: undesired_contacts -10
+        #   + AMP style (agent side, untouched)
+        # DELIBERATE deviation (recorded): the initial 17th term
+        # arm_pitch_mean_offset (-0.1) is NOT resurrected — its MEAN
+        # statistic was FK-disproven in v28b (blind to the one-fwd-one-back
+        # defect, penalized natural swing) and the disc now sees the arms
+        # (v38 10-body obs), superseding its intent.
+        # Everything accumulated v27-v72 is zeroed here (the full list is
+        # explicit below so the diff against intent is reviewable).
+        # ------------------------------------------------------
+        import os as _os_v73
+        if _os_v73.environ.get("X1_INITIAL_REWARD", "0") == "1":
+            # v74 (RECORD_BOOK §9): X1_INITIAL_REWARD=1 + X1_GAIT_CLOCK=1 is
+            # the LEGITIMATE "initial reward + clock ONLY" single-variable
+            # re-add — the v71 block above has already applied the clock
+            # obs (policy/critic +4) and the foot_clock/contact_clock
+            # weights, so those two terms are EXEMPT from the reset below.
+            # Everything else v27-v72 stays OFF. (v73 = clock absent.)
+            _v74_clock = _os_v73.environ.get("X1_GAIT_CLOCK", "0") == "1"
+            # v78 (RECORD_BOOK §9): X1_ARM_GUARDS=1 — the v70b arm-posture
+            # guard package (X1_SY_GUARD / X1_LEAN_GUARD at the v70b
+            # delivery doses 0.5/0.5) is EXEMPT from the reset: the v77
+            # verdict FALSIFIED H5 (the smoothing split freed arm motion
+            # but without posture anchoring the arms drifted into a
+            # forward-lean solution — P7g 60-63 deg vs 24.8 baseline), so
+            # the guards (P7g/P7h exact statistics) are the next single
+            # variable from the initial+clock recipe.
+            _v78_guards = _os_v73.environ.get("X1_ARM_GUARDS", "0") == "1"
+            # v79 (RECORD_BOOK §9): X1_ARM_ASYM=1 — the v28b/v54
+            # antisymmetric-DC guard (arm_asym_lean, EMA difference
+            # statistic, dose via X1_ARM_ASYM default -1.2). v78
+            # forensics: P7h shared lean FIXED (24.2 -> 0.1) but the arms
+            # re-solved into a FROZEN ANTIPHASE-OFFSET pose (shoL mean
+            # -53 / shoR +33 deg, corr -0.9, R elbow frozen 80 deg) —
+            # exactly the one-forward-one-back family the difference
+            # statistic was built for (P7g lean_asym 146 = |phiL-phiR|).
+            _v79_asym = _os_v73.environ.get("X1_ARM_ASYM", "0") != "0"
+            self.rewards.track_lin_vel_xy_exp.weight = float(
+                _os_v73.environ.get("X1_TRACK_W", "1.25"))  # v76 dose knob
+            # v85 (RECORD_BOOK 12.1): X1_TRACK_STD — kernel TEMPERATURE of
+            # the linear-velocity tracking term (std 0.5 -> 0.25 steepens
+            # the pull toward the command; distinct from the v76-falsified
+            # WEIGHT scaling: shape vs amplitude). The v84 finding: speed
+            # equilibrium ~0.85 is invariant under clock cadence changes
+            # (0.91Hz->1.05Hz moved step 0.51->0.43, speed constant) — the
+            # bottleneck is the task-style balance, so steepen the task
+            # side's gradient at the operating point.
+            _v85_std = float(_os_v73.environ.get("X1_TRACK_STD", "0"))
+            if _v85_std > 0:
+                self.rewards.track_lin_vel_xy_exp.params["std"] = _v85_std
+                print(f"[TRACK-STD] v85: track_lin_vel_xy_exp kernel std "
+                      f"0.5 -> {_v85_std:g} (temperature; weight unchanged)")
+            self.rewards.track_ang_vel_z_exp.weight = 1.25
+            self.rewards.alive.weight = 0.15
+            self.rewards.ang_vel_xy_l2.weight = -0.1
+            self.rewards.flat_orientation_l2.weight = -1.2
+            self.rewards.joint_vel_l2.weight = -2e-4
+            self.rewards.joint_acc_l2.weight = -2.5e-7
+            self.rewards.joint_acc_l2.params = {
+                "asset_cfg": SceneEntityCfg("robot")}  # whole 29 joints
+            self.rewards.action_rate_l2.weight = -0.01
+            self.rewards.action_rate_l2.func = mdp.action_rate_l2  # whole robot
+            self.rewards.action_rate_l2.params = {}
+            self.rewards.joint_pos_limits.weight = -1.0
+            self.rewards.joint_energy.weight = -1e-4
+            self.rewards.joint_torques_l2.weight = -1e-5
+            self.rewards.feet_slide.weight = -0.1
+            self.rewards.sound_suppression.weight = -5e-5
+            self.rewards.feet_distance_y.weight = 0.05
+            self.rewards.feet_distance_y.params["max"] = 0.50
+            self.rewards.undesired_contacts.weight = -10.0
+            # zero every accumulated term (v27-v72), explicit; the v74
+            # clock package (foot_clock/contact_clock) is exempt above:
+            _zero = [
+                "lin_vel_z_l2", "joint_acc_l2_arms", "action_rate_l2_arms",
+                "smoothness_1", "joint_regularization",
+                "arm_pitch_sync", "arm_leg_coupling",
+                "lumbar_posture", "arm_amp_prior", "arm_amp_phase",
+                "knee_extension", "heel_first", "leg_amp_asym", "hip_phase",
+                "heel_down_ready", "swing_clearance", "ankle_flick",
+                "foot_yaw_neutral", "hip_roll_abduction",
+                "demo_joint_track", "lateral_sway",
+                "gait_period", "swing_airtime",
+                "stance_sole_flat", "yaw_bias",
+            ]
+            if not _v74_clock:
+                _zero += ["foot_clock", "contact_clock"]
+            if not _v78_guards:
+                _zero += ["shoulder_yaw_fold", "arm_shared_lean"]
+            if not _v79_asym:
+                _zero += ["arm_asym_lean"]
+            for _t in _zero:
+                getattr(self.rewards, _t).weight = 0.0
+            # v77 (RECORD_BOOK §9): X1_ARM_SMOOTH=1 — the v40 arm-channel
+            # smoothing split, the SECOND controlled addition from the
+            # initial table (H5: the arm-form regression of the v73-v76
+            # family — P7b elbow / P7a anti — is caused by the uniform
+            # full-strength smoothing making arm motion expensive, not by
+            # the missing guards). v40 SEMANTICS (no double penalty): the
+            # base acc/rate terms narrow to legs+torso (17 joints) and the
+            # arm terms carry the v51 delivery doses.
+            if _os_v73.environ.get("X1_ARM_SMOOTH", "0") == "1":
+                # NOTE (v77 crash forensics, TASK_20261024_056): each term
+                # MUST own an INDEPENDENT SceneEntityCfg instance — sharing
+                # one object across terms makes the manager's resolve pass
+                # fill joint_ids on the first parse and then die with
+                # "Both 'joint_names' and 'joint_ids' are specified, and
+                # are not consistent" on the second (RECORD_BOOK §6).
+                _leg_acc_joints = [".*(hip|knee|ankle|lumbar).*_joint"]
+                self.rewards.joint_acc_l2.params = {
+                    "asset_cfg": SceneEntityCfg(
+                        "robot", joint_names=list(_leg_acc_joints))}
+                # the whole-robot mdp.action_rate_l2 takes no asset_cfg —
+                # restore the v40 joints variant for the split
+                self.rewards.action_rate_l2.func = mdp.action_rate_l2_joints
+                self.rewards.action_rate_l2.params = {
+                    "asset_cfg": SceneEntityCfg(
+                        "robot", joint_names=list(_leg_acc_joints))}
+                self.rewards.joint_acc_l2_arms.weight = -6.25e-8
+                self.rewards.action_rate_l2_arms.weight = -0.0025
+                print("[ARM-SMOOTH] v77: v40 split restored — base acc/rate "
+                      "legs+torso only, arms at v51 delivery doses "
+                      "(-6.25e-8 / -0.0025)")
+            _v80_form = _os_v73.environ.get("X1_FORM_PACKAGE", "0") == "1"
+            if not _v80_form:
+                _zero += ["foot_yaw_neutral", "hip_roll_abduction",
+                          "stance_sole_flat", "arm_dc_band", "hip_yaw_neutral",
+                          "stance_separation_hinge", "step_length_clock",
+                          "chest_lean"]
+            if _v80_form:
+                # v80 FORM PACKAGE (RECORD_BOOK section 10, user defect spec
+                # 2026-10-26: feet everted/toe-out walk + arms held up).
+                # Fresh-design single variable on top of the v76 delivery
+                # recipe (initial-15 + clock + track 2.0 + tol 0.15):
+                # the LEG guards use the v69-calibrated statistics (the
+                # discriminator is structurally blind to hip yaw/ankle roll
+                # -- key-body positions invariant), the ARM guard is the new
+                # complete four-joint DC anchor.
+                self.rewards.foot_yaw_neutral.weight = -float(
+                    _os_v73.environ.get("X1_TOE_GUARD", "0.6"))   # band 6 deg
+                self.rewards.hip_roll_abduction.weight = -float(
+                    _os_v73.environ.get("X1_ABD_GUARD", "0.8"))   # band 4 deg EMA
+                self.rewards.stance_sole_flat.weight = -float(
+                    _os_v73.environ.get("X1_SOFLAT_W", "1.5"))    # v27 phased dose
+                self.rewards.arm_dc_band.weight = -float(
+                    _os_v73.environ.get("X1_ARM_DC_W", "0.3"))    # bands in term
+                # v81 dose round (RECORD_BOOK section 10): failing-family
+                # escalation only -- arm DC -0.3 -> -0.9 (the m3999
+                # equilibrium shoR -46 paid only ~0.33/step at -0.3) + NEW
+                # hip_yaw DC band (F3 residual +-16 deg, feet compensated
+                # forward via the ankle chain). Same generic EMA-band func.
+                _v81_hipyaw = float(_os_v73.environ.get("X1_HIPYAW_W", "0"))
+                if _v81_hipyaw > 0:
+                    self.rewards.hip_yaw_neutral.weight = -_v81_hipyaw
+                # v82 (RECORD_BOOK 10.6): BAND TIGHTENING of the failing
+                # families (the v81 tree branch: at -0.9 the arm equilibrium
+                # paid ~0.1/step and stayed out -- make the same pose cost
+                # more instead of another dose x2). Env-tunable so v80/v81
+                # defaults stay byte-identical.
+                _shor = float(_os_v73.environ.get("X1_SHOR_BAND_DEG", "20"))
+                _elb = float(_os_v73.environ.get("X1_ELBOW_HALF_DEG", "40"))
+                _hy = float(_os_v73.environ.get("X1_HIPYAW_BAND_DEG", "8"))
+                _elb_c = math.radians(20.0)
+                self.rewards.arm_dc_band.params["bands"] = [
+                    (0.0, math.radians(25.0)), (0.0, math.radians(_shor)),
+                    (0.0, math.radians(15.0)), (_elb_c, math.radians(_elb))] * 2
+                self.rewards.hip_yaw_neutral.params["bands"] = [
+                    (0.0, math.radians(_hy))] * 2
+                if _shor != 20.0 or _elb != 40.0 or _hy != 8.0:
+                    print(f"[FORM-PACKAGE] v82 band tightening: shoR "
+                          f"{_shor:g} deg / elbow 20+-{_elb:g} / hip_yaw "
+                          f"{_hy:g} (doses unchanged)")
+                # v83 (RECORD_BOOK section 11, user defect spec 2026-10-27:
+                # feet walk severely wider than shoulder width): STANCE
+                # PACKAGE, two knobs on the SAME statistic (root-frame foot
+                # separation) --
+                #   X1_STANCE_MAX       exp bonus band max 0.50 -> 0.30
+                #                      (MUST be applied here: line above
+                #                      resets it to 0.50 unconditionally)
+                #   X1_STANCE_HINGE_W   NEW linear hinge beyond
+                #   X1_STANCE_HINGE_MAX (default 0.32) on a 1 s EMA -- the
+                #                      exp kernel is flat at the 0.45 m
+                #                      defect (gradient 1e-7), the hinge
+                #                      pays 0.13*w/step there.
+                # v83 audit: policy 447-477 mm vs shoulder 292 / demo 306;
+                # v69 precedent fixed 460->330 with band 0.38+abd guard.
+                _v83_stance_max = float(_os_v73.environ.get("X1_STANCE_MAX", "0"))
+                if _v83_stance_max > 0:
+                    self.rewards.feet_distance_y.params["max"] = _v83_stance_max
+                    print(f"[STANCE-PACKAGE] v83: feet_distance_y bonus band "
+                          f"max 0.50 -> {_v83_stance_max:.2f}")
+                _v83_hinge_w = float(_os_v73.environ.get("X1_STANCE_HINGE_W", "0"))
+                if _v83_hinge_w > 0:
+                    self.rewards.stance_separation_hinge.weight = -_v83_hinge_w
+                    self.rewards.stance_separation_hinge.params["max"] = float(
+                        _os_v73.environ.get("X1_STANCE_HINGE_MAX", "0.32"))
+                    print(f"[STANCE-PACKAGE] v83: separation hinge "
+                          f"-{_v83_hinge_w:g} beyond "
+                          f"{self.rewards.stance_separation_hinge.params['max']:.2f} "
+                          f"(EMA tau 1 s)")
+                # v91 (RECORD_BOOK 12.12, adjudication lever B2): ANALYTIC
+                # STEP-LENGTH DRIVE — exp kernel at each touchdown on
+                # |step - v_cmd/(1.86 x f_clk)|; bypasses the style anchor.
+                _v91_step_w = float(_os_v73.environ.get("X1_STEP_DRIVE_W", "0"))
+                if _v91_step_w > 0:
+                    self.rewards.step_length_clock.weight = _v91_step_w
+                    print(f"[STEP-DRIVE] v91: analytic step target "
+                          f"L*(1.0)=0.511 m (ratio 1.86, clock 1.053 Hz), "
+                          f"w={_v91_step_w:g}, sigma 0.05")
+                # v94 (RECORD_BOOK 13): CHEST LEAN GUARD — the 腰后仰 fix.
+                # Hinge free in [0, +20 deg] (demo stream +2..+11); the
+                # q4499 delivery pins at -10 deg. Default 0 = byte-identical.
+                _v94_chest_w = float(_os_v73.environ.get("X1_CHEST_LEAN_W", "0"))
+                if _v94_chest_w != 0:
+                    self.rewards.chest_lean.weight = _v94_chest_w
+                    _v94_lo = float(_os_v73.environ.get("X1_CHEST_LEAN_LO", "0.0"))
+                    _v94_hi = float(_os_v73.environ.get("X1_CHEST_LEAN_HI", "0.35"))
+                    self.rewards.chest_lean.params["lo"] = _v94_lo
+                    self.rewards.chest_lean.params["hi"] = _v94_hi
+                    print(f"[CHEST-LEAN] v94: chest tilt hinge band "
+                          f"[{np.degrees(_v94_lo):.0f}, {np.degrees(_v94_hi):.0f}] deg, "
+                          f"w={_v94_chest_w:g} (demo stream +2..+11; q4499 sits -10)")
+                # v95 (RECORD_BOOK 14): QUIET-HANDS — swing-amplitude bands
+                # on the 12 distal arm channels (shoR/shoY/elbP/elbY/wriP/
+                # wriR x L/R). Demos are a rigid shoP pendulum (distal
+                # frozen 36/36); x7398 pumps them at gait frequency.
+                # Default 0 = byte-identical.
+                _v95_quiet_w = float(_os_v73.environ.get("X1_ARM_QUIET_W", "0"))
+                if _v95_quiet_w != 0:
+                    self.rewards.arm_distal_amp.weight = _v95_quiet_w
+                    print(f"[ARM-QUIET] v95: distal swing RMS bands "
+                          f"[shoR 8.0 / shoY 2.9 / elbP 2.9 / elbY 2.9 / "
+                          f"wriP 9.2 / wriR 7.4] deg x2 sides, "
+                          f"w={_v95_quiet_w:g} (x7398 defect 1.32 rad walk10)")
+                # v95c (RECORD_BOOK 14.5, audit item 2): AMP-under-
+                # ANTIPHASE — shoP amplitude band x L/R sync gate (cap 0.24 rad = 13.7 deg, demo max 13.1).
+                # Default 0 = byte-identical.
+                _v95c_anti_w = float(_os_v73.environ.get("X1_AMP_ANTI_W", "0"))
+                if _v95c_anti_w != 0:
+                    self.rewards.arm_amp_anti.weight = _v95c_anti_w
+                    print(f"[AMP-ANTI] v95c: shoP min-amp band "
+                          f"[0.52, 0.79] rad x sync gate cap 0.24 rad, "
+                          f"w={_v95c_anti_w:g} (demo sync 5-13 deg vs "
+                          f"policy 17-25; corr(phiL,phiR) -0.35 -> <=-0.6)")
+                print("[FORM-PACKAGE] v80: toe -0.6 (band 6deg) / abd -0.8 "
+                      "(band 4deg EMA) / soflat -1.5 (phased) / arm_dc -0.3 "
+                      "(shoP 25 / shoR 20 / shoY 15 / elbow 20+-40 deg EMA "
+                      "tau 8s) -- the FORM dimension the initial table lacks")
+            print("[INITIAL-REWARD] v73/v74: reward table RESET to the initial "
+                  "15-term design (6ea0655; the 16th, arm_pitch_mean_offset, "
+                  "deliberately not resurrected — v28b FK-disproven); all "
+                  "v27-v72 additions OFF (guards, priors); "
+                  f"clock package {'ON (v74: foot_clock/contact_clock kept)' if _v74_clock else 'OFF (v73)'}; "
+                  "feet_distance_y max=0.50; whole-robot smoothing terms")
+
+        # ------------------------------------------------------
+        # v73 audit discipline (RECORD_BOOK §6): every run prints its
+        # FINAL active reward table, so 'code changed but run did not'
+        # becomes detectable from the task log alone.
+        # ------------------------------------------------------
+        _active = sorted(
+            (name, float(term.weight)) for name, term in self.rewards.__dict__.items()
+            if getattr(term, "weight", 0) != 0)
+        print(f"[REWARD-TABLE] active terms ({len(_active)}): "
+              + ", ".join(f"{n}={w:g}" for n, w in _active))
+
+        if self.__class__.__name__ == "X1AmpEnvCfg":
+            self.disable_zero_weight_rewards()
+
+
+@configclass
+class X1AmpEnvCfg_PLAY(X1AmpEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.num_envs = 1
+        self.scene.env_spacing = 2.5
+        self.episode_length_s = 40.0
+
+        self.commands.base_velocity.ranges.lin_vel_x = (1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        # eval/play must be clean (no delay injection)
+        self.action_delay_steps = 0
+        self.obs_delay_steps = 0
+
+        self.observations.policy.enable_corruption = False
+        self.events.push_robot = None
