@@ -25,6 +25,9 @@ if _old:
     _parts.append(_old)
 os.environ["PYTHONPATH"] = ":".join(_parts)
 print(f"[STAND] PYTHONPATH={os.environ['PYTHONPATH']}", flush=True)
+# this process's own sys.path (PYTHONPATH is only read at interpreter start)
+sys.path.insert(0, str(_root / "robolab"))
+sys.path.insert(0, str(_root / "rsl_rl"))
 
 from isaaclab.app import AppLauncher  # noqa: E402
 
