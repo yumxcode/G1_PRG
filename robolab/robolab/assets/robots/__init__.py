@@ -31,3 +31,4 @@
 
 from .roboparty import *
 from .x1 import *
+from .g1 import *
