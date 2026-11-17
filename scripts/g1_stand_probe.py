@@ -41,13 +41,13 @@ import robolab.tasks  # noqa: F401,E402  (registers G1-AMP)
 
 env = gym.make("G1-AMP", cfg_entry_point_type=None) if False else None
 # use the plain isaclab make path
-from isaaclab.envs import ManagerBasedRLEnv  # noqa: E402
+from robolab.tasks.manager_based.amp.g1_amp_env import G1AmpEnv  # noqa: E402
 from robolab.tasks.manager_based.amp.g1_amp_env_cfg import G1AmpEnvCfg  # noqa: E402
 
 cfg = G1AmpEnvCfg()
 cfg.scene.num_envs = 4
 cfg.sim.device = os.environ.get("G1_PROBE_DEVICE", "cuda:0")
-env = ManagerBasedRLEnv(cfg=cfg)
+env = G1AmpEnv(cfg=cfg)
 
 N = int(os.environ.get("G1_STAND_STEPS", "100"))
 obs, _ = env.reset()
