@@ -2,7 +2,7 @@
 """B0 baseline launcher (gradmotion): G1-AMP with the v71 FIXED exogenous
 gait clock — the control arm of the pre-registered exp chain (exp_a7fb423e).
 C1a differs ONLY in G1_PRG=1 (single variable). Full training: 4096 envs,
-4000 iters, save every 500.
+4000 iters, save every 500. v5: 1024 envs x 8000 iters (judge5-verified learning regime; the 4096-envs variant never learns on G1, see exp_a7fb423e).
 """
 import os
 import subprocess
@@ -32,8 +32,8 @@ argv = [
     "--task=G1-AMP",
     "--headless",
     "--logger=tensorboard",
-    "--num_envs=" + os.environ.get("G1_TRAIN_ENVS", "4096"),
-    "--max_iterations=" + os.environ.get("G1_TRAIN_ITERS", "4000"),
+    "--num_envs=" + os.environ.get("G1_TRAIN_ENVS", "1024"),
+    "--max_iterations=" + os.environ.get("G1_TRAIN_ITERS", "8000"),
     "--run_name=" + os.environ.get("G1_RUN_NAME", "b0_fixed_clock_v1"),
 ]
 print(f"[B0] argv={argv}", flush=True)
