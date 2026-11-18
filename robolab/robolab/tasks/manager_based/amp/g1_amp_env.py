@@ -26,6 +26,7 @@ directly readable from the task log.
 """
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -144,6 +145,26 @@ class G1AmpEnv(AmpEnv):
 
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_env_ids) > 0:
+            # [PRG] SAMPLING diagnostics (tensor-only, no python loops; the
+            # per-reset python loop was a 42x perf poison — pit_8f1e6c0c):
+            # accumulate dying envs' root-z and tilt, print every 2000 resets.
+            diag = getattr(self, "_diag", None)
+            if diag is None:
+                diag = self._diag = {"n": 0, "z_sum": 0.0, "tilt_sum": 0.0,
+                                     "bad_ori": 0, "printed": 0}
+            diag["n"] += int(len(reset_env_ids))
+            zs = self.scene["robot"].data.root_pos_w[reset_env_ids, 2]
+            diag["z_sum"] += float(zs.sum())
+            q = self.scene["robot"].data.root_quat_w[reset_env_ids, :]
+            tilt = 2.0 * torch.acos(q[:, 0].clamp(-1.0, 1.0))
+            diag["tilt_sum"] += float(tilt.sum())
+            diag["bad_ori"] += int(
+                self.termination_manager.get_term("bad_orientation")[reset_env_ids].sum())
+            if diag["n"] >= (diag["printed"] + 1) * 2000:
+                diag["printed"] += 1
+                print(f"[DIAG] resets={diag['n']} death_z_mean={diag['z_sum']/diag['n']:.3f} "
+                      f"tilt_mean={math.degrees(diag['tilt_sum']/diag['n']):.1f}deg "
+                      f"bad_ori_frac={diag['bad_ori']/diag['n']:.2f}", flush=True)
             self.recorder_manager.record_pre_reset(reset_env_ids)
             self._reset_idx(reset_env_ids)
             self.scene.write_data_to_sim()
