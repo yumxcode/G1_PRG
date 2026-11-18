@@ -1,0 +1,86 @@
+{
+ "meta": {
+  "robot": "g1_29dof (GMR g1_mocap_29dof.xml, meshes stripped)",
+  "ckpt": "random",
+  "policy": {
+   "src": "random-mlp",
+   "seed": 0
+  },
+  "act_dim": 30,
+  "delta_f_channel": true,
+  "cmd": [
+   0.8,
+   0.0,
+   0.0
+  ],
+  "control_dt": 0.02,
+  "duration_s": 4.5,
+  "settle_s": 0.5,
+  "prg_mode": "hard",
+  "freeze_alpha": false,
+  "prg_reset_events": 2,
+  "prg_f_eff_hz_final": 0.8572885439867859,
+  "prg_alpha_final": 0.07100000000000004,
+  "actuator_mode": "native",
+  "pd_every": 5,
+  "mujoco_timestep": 0.001,
+  "substeps": 20,
+  "pd_json": null,
+  "pd_table": "G1 v1 (G1_CFG-derived)",
+  "obs_dim": 300,
+  "frame_dim": 100,
+  "hist": 3,
+  "clock_layout": "[sinL, sinR, cosL, cosR]",
+  "obs_layout": "term-major x3: ang_b(3) grav_b(3) cmd(3) qpos_rel(29) qvel_rel(29) last_act(29) clock(4)",
+  "robustness": {
+   "obs_noise": 0.0,
+   "latency_steps": 0,
+   "action_lag": 0,
+   "action_lpf": 0.0,
+   "push_mag": 0.0,
+   "torso_mass_scale": 1.0,
+   "seed": 0
+  }
+ },
+ "survival": {
+  "survived_steps": 47,
+  "survived_s": 0.9400000000000001,
+  "fell": true,
+  "fall_reason": "tilt=60.2",
+  "final_base_z": 0.5013928864491963,
+  "distance_m": 0.6792676989081213,
+  "mean_vxy_err": 0.48371594146299657,
+  "mean_yaw_err": 0.07565995823508306
+ },
+ "gait": {
+  "left_ankle_roll_link": {
+   "n_events": 0,
+   "cycle_s_med": null,
+   "cadence_hz": null,
+   "cadence_spm": null,
+   "duty_med": null,
+   "swing_s_med": null,
+   "step_len_m_med": null,
+   "slip_mps_med": null,
+   "phase_sync_err_mean_abs": NaN,
+   "phase_sync_err_std": NaN,
+   "phase_sync_err_max_abs": NaN
+  },
+  "right_ankle_roll_link": {
+   "n_events": 0,
+   "cycle_s_med": null,
+   "cadence_hz": null,
+   "cadence_spm": null,
+   "duty_med": null,
+   "swing_s_med": null,
+   "step_len_m_med": null,
+   "slip_mps_med": null,
+   "phase_sync_err_mean_abs": NaN,
+   "phase_sync_err_std": NaN,
+   "phase_sync_err_max_abs": NaN
+  },
+  "overall": {
+   "phase_sync_err_mean_abs": null
+  }
+ }
+}
