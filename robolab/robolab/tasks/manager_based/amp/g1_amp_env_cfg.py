@@ -252,7 +252,12 @@ class G1AmpEnvCfg(X1AmpEnvCfg):
         # bad_orientation (>60 deg torso tilt). Contact QUALITY stays in
         # the undesired_contacts reward.
         self.terminations.base_contact.params["threshold"] = 1.0e9
-        self.terminations.base_height.params["minimum_height"] = 0.45
+        # v4 (DIAG TASK_20261118_167): death_z_mean=0.455 == exactly this line —
+        # half the population dies CROUCHING (early policy dips, PD sag;
+        # tilt stats say the other half truly falls at 114deg). Let the
+        # crouchers LIVE and learn to rise: 0.45 -> 0.25 (X1 default 0.2);
+        # falls are still caught by bad_orientation 60deg.
+        self.terminations.base_height.params["minimum_height"] = 0.25
 
         # Discriminator key bodies: 10 role-identical G1 bodies (G1 demo
         # library pending; kept consistent for the future retarget schema).
